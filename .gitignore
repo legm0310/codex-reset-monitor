@@ -1,0 +1,4 @@
+/codex-reset-monitor
+/.env
+/state.json
+/state.json.tmp
