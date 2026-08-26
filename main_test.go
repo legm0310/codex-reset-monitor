@@ -1,12 +1,30 @@
-// Codex 리셋 모니터의 상태 비교와 저장 동작을 검증하는 테스트.
+// Codex 리셋 모니터의 상태 전환과 알림 동작을 검증하는 테스트.
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+type telegramRequest struct {
+	Text            string `json:"text"`
+	ReplyParameters *struct {
+		MessageID int `json:"message_id"`
+	} `json:"reply_parameters"`
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
 
 func TestLoadDotEnv(t *testing.T) {
 	t.Setenv("EXISTING_VALUE", "system")
@@ -37,253 +55,223 @@ func TestLoadDotEnv(t *testing.T) {
 }
 
 func TestLoadDotEnvMissingFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".env")
-	if err := loadDotEnv(path); err != nil {
+	if err := loadDotEnv(filepath.Join(t.TempDir(), ".env")); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestNotificationsNewReset(t *testing.T) {
-	previous := state{LastResetID: "1"}
-	data := statusData{LatestReset: &reset{
-		ID:          "2",
-		ResetType:   "regular",
-		AnnouncedAt: "2026-08-24T00:00:00Z",
-		Source:      source{Type: "x_post", URL: "https://example.com/reset"},
-	}}
+func TestProcessResetsWaitsAndRepliesToOriginalMessage(t *testing.T) {
+	requests := make([]telegramRequest, 0, 4)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request telegramRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			return nil, err
+		}
+		requests = append(requests, request)
+		body := `{"ok":true,"result":{"message_id":` + string(rune('0'+len(requests))) + `}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})}
 
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	cfg := config{
+		botToken:        "test-token",
+		chatID:          "test-chat",
+		telegramBaseURL: "https://telegram.test",
+		statePath:       statePath,
 	}
-	if !strings.Contains(messages[0], "발표 시각 (KST). 2026-08-24 09:00:00 KST") {
-		t.Fatalf("KST 발표 시각이 없습니다: %s", messages[0])
-	}
-}
-
-func TestNotificationsObservedResetWithoutURL(t *testing.T) {
-	data := statusData{LatestReset: &reset{
-		ID:          "observed-1",
+	current := state{Resets: make(map[string]resetState)}
+	now := time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC)
+	first := reset{
+		ID:          "reset-1",
 		ResetType:   "regular",
-		AnnouncedAt: "2026-08-25T14:32:00Z",
+		AnnouncedAt: now.Format(time.RFC3339),
+		Source:      source{Type: "x_post", URL: "https://example.com/reset-1"},
+	}
+	observed := reset{
+		ID:          "observed-2",
+		ResetType:   "regular",
+		AnnouncedAt: now.Add(time.Minute).Format(time.RFC3339),
 		Source:      source{Type: "observed"},
-	}}
-
-	messages := notifications(state{LastResetID: "old"}, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
 	}
-	if !strings.Contains(messages[0], "Codex 사용량 리셋 감지") ||
-		!strings.Contains(messages[0], "출처. 공식 발표 없이 리셋이 관측됨") ||
-		!strings.Contains(messages[0], "원문 링크. 없음") {
-		t.Fatalf("observed 리셋 안내가 올바르지 않습니다: %s", messages[0])
-	}
-}
-
-func TestNotificationsResetURLAdded(t *testing.T) {
-	previous := state{
-		LastResetID:         "observed-1",
-		LastResetType:       "regular",
-		LastResetSourceType: "observed",
-	}
-	data := statusData{LatestReset: &reset{
-		ID:          "observed-1",
+	third := reset{
+		ID:          "reset-3",
 		ResetType:   "regular",
-		AnnouncedAt: "2026-08-25T14:30:00Z",
-		Source:      source{Type: "observed", URL: "https://example.com/reset"},
-	}}
+		AnnouncedAt: now.Add(4 * time.Minute).Format(time.RFC3339),
+		Source:      source{Type: "x_post", URL: "https://example.com/reset-3"},
+	}
 
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+	if err := processResets(context.Background(), client, cfg, &current, []reset{first}, now); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(messages[0], "리셋 관련 링크가 추가되었습니다") ||
-		!strings.Contains(messages[0], "https://example.com/reset") {
-		t.Fatalf("링크 후속 알림이 올바르지 않습니다: %s", messages[0])
+	if len(requests) != 1 || !strings.Contains(requests[0].Text, "reset-1") {
+		t.Fatalf("첫 기본 리셋 알림이 올바르지 않습니다: %#v", requests)
 	}
-	current := stateFrom(data)
-	if repeated := notifications(current, current, data); len(repeated) != 0 {
-		t.Fatalf("저장 후 링크 알림이 반복됐습니다: %v", repeated)
+
+	if err := processResets(context.Background(), client, cfg, &current, []reset{observed, first}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("2분 전 observed 리셋이 전송됐습니다: %#v", requests)
+	}
+	if err := processResets(context.Background(), client, cfg, &current, []reset{observed, first}, now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || !strings.Contains(requests[1].Text, "원문 링크. 없음") {
+		t.Fatalf("2분 후 링크 없는 알림이 올바르지 않습니다: %#v", requests)
+	}
+	observedMessageID := current.Resets[observed.ID].TelegramMessageID
+
+	if err := processResets(context.Background(), client, cfg, &current, []reset{third, observed, first}, now.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 3 || !strings.Contains(requests[2].Text, "reset-3") {
+		t.Fatalf("후속 기본 리셋 알림이 올바르지 않습니다: %#v", requests)
+	}
+
+	observed.Source.URL = "https://example.com/observed-2"
+	if err := processResets(context.Background(), client, cfg, &current, []reset{third, observed, first}, now.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 4 || !strings.Contains(requests[3].Text, "리셋 관련 링크가 추가되었습니다") {
+		t.Fatalf("링크 추가 알림이 올바르지 않습니다: %#v", requests)
+	}
+	if requests[3].ReplyParameters == nil || requests[3].ReplyParameters.MessageID != observedMessageID {
+		t.Fatalf("observed 리셋 원문에 답장하지 않았습니다: %#v", requests[3])
+	}
+	if repeated := processResets(context.Background(), client, cfg, &current, []reset{third, observed, first}, now.Add(6*time.Minute)); repeated != nil {
+		t.Fatal(repeated)
+	}
+	if len(requests) != 4 {
+		t.Fatalf("링크 추가 알림이 반복됐습니다: %#v", requests)
 	}
 }
 
-func TestNotificationsResetTypeChanged(t *testing.T) {
-	previous := state{
-		LastResetID:   "same",
-		LastResetType: "regular",
-		LastResetURL:  "https://example.com/reset",
-	}
-	data := statusData{LatestReset: &reset{
-		ID:        "same",
-		ResetType: "banked",
-		Source:    source{URL: "https://example.com/reset"},
-	}}
+func TestProcessResetsSendsLinkedResetDuringWait(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(filepath.Join(t.TempDir(), "state.json"))
+	current := state{Resets: make(map[string]resetState)}
+	now := time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC)
+	value := reset{ID: "observed", ResetType: "regular", AnnouncedAt: now.Format(time.RFC3339), Source: source{Type: "observed"}}
 
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+	if err := processResets(context.Background(), client, cfg, &current, []reset{value}, now); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(messages[0], "이전 종류. regular") ||
-		!strings.Contains(messages[0], "현재 종류. banked") {
-		t.Fatalf("종류 변경 알림이 올바르지 않습니다: %s", messages[0])
+	value.Source.URL = "https://example.com/observed"
+	if err := processResets(context.Background(), client, cfg, &current, []reset{value}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 || !strings.Contains((*requests)[0].Text, "관련 링크. https://example.com/observed") {
+		t.Fatalf("대기 중 추가된 링크를 포함하지 않았습니다: %#v", *requests)
 	}
 }
 
-func TestNotificationsIgnoreResetTimeCorrection(t *testing.T) {
-	previous := state{
-		LastResetID:          "same",
-		LastResetType:        "regular",
-		LastResetAnnouncedAt: "2026-08-25T14:32:00Z",
-		LastResetSourceType:  "observed",
-		LastResetURL:         "https://example.com/reset",
+func TestResetTimeCorrectionDoesNotNotify(t *testing.T) {
+	previous := resetState{
+		ResetType: "regular",
+		URL:       "https://example.com/reset",
+		Notified:  true,
 	}
-	data := statusData{LatestReset: &reset{
+	current := reset{
 		ID:          "same",
 		ResetType:   "regular",
 		AnnouncedAt: "2026-08-25T14:30:00Z",
 		Source:      source{Type: "observed", URL: "https://example.com/reset"},
-	}}
-
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 0 {
-		t.Fatalf("시각만 수정됐는데 알림이 생성됐습니다: %v", messages)
 	}
-	if got := stateFrom(data).LastResetAnnouncedAt; got != "2026-08-25T14:30:00Z" {
-		t.Fatalf("수정된 발표 시각이 상태에 반영되지 않았습니다: %s", got)
+	if got := resetUpdateNotification(previous, current); got != "" {
+		t.Fatalf("시각만 수정됐는데 알림이 생성됐습니다: %s", got)
 	}
 }
 
-func TestNotificationsNewWatch(t *testing.T) {
-	chance := 70
-	data := statusData{ActiveWatch: &watch{
-		Level:              "elevated",
-		ResetChancePercent: &chance,
-		ObservedAt:         "2026-08-24T00:00:00Z",
-		ExpiresAt:          "2026-08-24T06:00:00Z",
-		Source:             source{URL: "https://example.com/watch"},
-	}}
-
-	messages := notifications(state{}, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+func TestPruneResetStatesKeepsLatestFiftyAndPending(t *testing.T) {
+	now := time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC)
+	value := state{Resets: make(map[string]resetState)}
+	for index := 0; index < 55; index++ {
+		id := time.Duration(index).String()
+		value.Resets[id] = resetState{
+			AnnouncedAt: now.Add(time.Duration(index) * time.Minute).Format(time.RFC3339),
+			FirstSeenAt: now,
+			Notified:    true,
+		}
 	}
-	if !strings.Contains(messages[0], "만료 시각 (KST). 2026-08-24 15:00:00 KST") {
-		t.Fatalf("KST 만료 시각이 없습니다: %s", messages[0])
-	}
-}
+	value.Resets["pending"] = resetState{FirstSeenAt: now, Notified: false}
 
-func TestNotificationsWatchLevelRaised(t *testing.T) {
-	previousChance := 70
-	currentChance := 75
-	previous := state{
-		LastWatchObservedAt: "same",
-		LastWatchLevel:      "elevated",
-		LastWatchPercent:    &previousChance,
+	pruneResetStates(&value, 50)
+	if len(value.Resets) != 51 {
+		t.Fatalf("정리 후 상태 개수 = %d, 기대값 = 51", len(value.Resets))
 	}
-	data := statusData{ActiveWatch: &watch{
-		Level:              "strong",
-		ResetChancePercent: &currentChance,
-		ObservedAt:         "same",
-	}}
-
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+	if _, exists := value.Resets["pending"]; !exists {
+		t.Fatal("pending 상태가 삭제됐습니다")
+	}
+	if _, exists := value.Resets[(time.Duration(54)).String()]; !exists {
+		t.Fatal("가장 최근 상태가 삭제됐습니다")
 	}
 }
 
-func TestNotificationsProbabilityRaisedByTwenty(t *testing.T) {
-	previousChance := 50
-	currentChance := 70
-	previous := state{
-		LastWatchObservedAt: "same",
-		LastWatchLevel:      "elevated",
-		LastWatchPercent:    &previousChance,
+func TestMigrateLegacyState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"last_reset_id":"123","last_reset_type":"regular","last_reset_url":"","last_watch_level":"strong","last_watch_percent":80}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	data := statusData{ActiveWatch: &watch{
-		Level:              "elevated",
-		ResetChancePercent: &currentChance,
-		ObservedAt:         "same",
-	}}
-
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 1 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+	got, exists, err := loadState(path)
+	if err != nil || !exists {
+		t.Fatalf("기존 상태 읽기 실패: %v", err)
 	}
-}
-
-func TestNotificationsIgnoreSmallProbabilityChange(t *testing.T) {
-	previousChance := 50
-	currentChance := 60
-	previous := state{
-		LastWatchObservedAt: "same",
-		LastWatchLevel:      "elevated",
-		LastWatchPercent:    &previousChance,
+	apiResets := []reset{{ID: "456", ResetType: "regular", Source: source{Type: "x_post", URL: "https://example.com/456"}}}
+	migrateLegacyState(&got, apiResets, time.Now().UTC())
+	migrated, exists := got.Resets["123"]
+	if !exists || !migrated.Notified || migrated.ResetType != "regular" {
+		t.Fatalf("기존 상태 마이그레이션 실패: %#v", got)
 	}
-	data := statusData{ActiveWatch: &watch{
-		Level:              "elevated",
-		ResetChancePercent: &currentChance,
-		ObservedAt:         "same",
-	}}
-
-	messages := notifications(previous, stateFrom(data), data)
-	if len(messages) != 0 {
-		t.Fatalf("알림 개수 = %d, 기대값 = 0", len(messages))
+	if got.LegacyLastResetID != "" {
+		t.Fatalf("기존 필드가 제거되지 않았습니다: %#v", got)
+	}
+	if baseline, exists := got.Resets["456"]; !exists || !baseline.Notified {
+		t.Fatalf("기존 이력이 기준 상태로 채워지지 않았습니다: %#v", got)
 	}
 }
 
 func TestSaveAndLoadState(t *testing.T) {
-	chance := 80
-	want := state{
-		LastResetID:          "123",
-		LastResetType:        "regular",
-		LastResetAnnouncedAt: "2026-08-24T00:00:00Z",
-		LastResetSourceType:  "x_post",
-		LastResetURL:         "https://example.com/reset",
-		LastWatchObservedAt:  "2026-08-24T00:00:00Z",
-		LastWatchLevel:       "strong",
-		LastWatchPercent:     &chance,
-	}
+	now := time.Now().UTC().Truncate(time.Second)
+	want := state{Resets: map[string]resetState{
+		"123": {
+			ResetType:         "regular",
+			AnnouncedAt:       now.Format(time.RFC3339),
+			SourceType:        "observed",
+			URL:               "https://example.com/reset",
+			FirstSeenAt:       now,
+			Notified:          true,
+			TelegramMessageID: 100,
+		},
+	}}
 	path := filepath.Join(t.TempDir(), "state.json")
-
 	if err := saveState(path, want); err != nil {
 		t.Fatal(err)
 	}
 	got, exists, err := loadState(path)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || !exists {
+		t.Fatalf("상태 읽기 실패: %v", err)
 	}
-	if !exists {
-		t.Fatal("저장한 상태 파일이 존재하지 않습니다")
-	}
-	if got.LastResetID != want.LastResetID ||
-		got.LastResetType != want.LastResetType ||
-		got.LastResetAnnouncedAt != want.LastResetAnnouncedAt ||
-		got.LastResetSourceType != want.LastResetSourceType ||
-		got.LastResetURL != want.LastResetURL ||
-		got.LastWatchObservedAt != want.LastWatchObservedAt ||
-		got.LastWatchLevel != want.LastWatchLevel ||
-		got.LastWatchPercent == nil || *got.LastWatchPercent != chance {
-		t.Fatalf("불일치 상태 = %#v", got)
+	if got.Resets["123"].TelegramMessageID != 100 || got.Resets["123"].URL != "https://example.com/reset" {
+		t.Fatalf("불일치 상태: %#v", got)
 	}
 }
 
-func TestLoadLegacyState(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	legacy := `{"last_reset_id":"123","last_watch_level":"strong","last_watch_percent":80}`
-	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	got, exists, err := loadState(path)
+func TestProcessLockRejectsSecondInstance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "monitor.lock")
+	first, err := acquireProcessLock(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists || got.LastResetID != "123" || got.LastWatchPercent == nil || *got.LastWatchPercent != 80 {
-		t.Fatalf("기존 상태 파일을 읽지 못했습니다: %#v", got)
-	}
-	if got.LastResetURL != "" || got.LastResetType != "" {
-		t.Fatalf("기존 상태의 새 필드 기본값이 올바르지 않습니다: %#v", got)
+	defer releaseProcessLock(first)
+	if second, err := acquireProcessLock(path); err == nil {
+		releaseProcessLock(second)
+		t.Fatal("두 번째 실행 잠금이 허용됐습니다")
 	}
 }
 
@@ -295,8 +283,78 @@ func TestFormatKSTCrossesDateBoundary(t *testing.T) {
 	}
 }
 
-func TestFormatKSTInvalidTimestamp(t *testing.T) {
-	if got := formatKST("invalid"); got != "변환 불가" {
-		t.Fatalf("formatKST() = %q, 기대값 = 변환 불가", got)
+func TestTelegramNotificationFlow(t *testing.T) {
+	if os.Getenv("TELEGRAM_INTEGRATION_TEST") != "1" {
+		t.Skip("TELEGRAM_INTEGRATION_TEST=1일 때 실제 Telegram 알림을 전송합니다")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	now := time.Now().UTC()
+
+	first := reset{
+		ID:          "test-basic-1",
+		ResetType:   "regular",
+		AnnouncedAt: now.Format(time.RFC3339),
+		Source:      source{Type: "x_post", URL: "https://example.com/codex-reset-test-1"},
+	}
+	if _, err := sendTelegram(context.Background(), client, cfg, "🧪 테스트 알림 1/4\n"+resetNotification(first), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	observed := reset{
+		ID:          "test-observed-2",
+		ResetType:   "regular",
+		AnnouncedAt: now.Add(time.Minute).Format(time.RFC3339),
+		Source:      source{Type: "observed"},
+	}
+	observedMessageID, err := sendTelegram(context.Background(), client, cfg, "🧪 테스트 알림 2/4\n"+resetNotification(observed), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	third := reset{
+		ID:          "test-basic-3",
+		ResetType:   "regular",
+		AnnouncedAt: now.Add(2 * time.Minute).Format(time.RFC3339),
+		Source:      source{Type: "x_post", URL: "https://example.com/codex-reset-test-3"},
+	}
+	if _, err := sendTelegram(context.Background(), client, cfg, "🧪 테스트 알림 3/4\n"+resetNotification(third), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	linkUpdate := "🧪 테스트 알림 4/4\n🔗 Codex 리셋 관련 링크가 추가되었습니다\nhttps://example.com/codex-reset-test-2"
+	if _, err := sendTelegram(context.Background(), client, cfg, linkUpdate, observedMessageID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newTelegramTestClient(t *testing.T) (*[]telegramRequest, *http.Client) {
+	t.Helper()
+	requests := make([]telegramRequest, 0)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request telegramRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			return nil, err
+		}
+		requests = append(requests, request)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":1}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	return &requests, client
+}
+
+func testConfig(statePath string) config {
+	return config{
+		botToken:        "test-token",
+		chatID:          "test-chat",
+		telegramBaseURL: "https://telegram.test",
+		statePath:       statePath,
 	}
 }

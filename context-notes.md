@@ -49,6 +49,27 @@
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
 - `git diff --check`가 통과했다.
 
+## 2026-08-26 리셋별 상태와 2분 대기 정책
+
+- 링크 없는 신규 리셋은 최초 발견부터 2분간 기다린다.
+- 2분 이내 링크가 추가되면 링크를 포함한 전체 알림을 보내고, 계속 없으면 링크 없음으로 알린다.
+- 최초 알림의 Telegram `message_id`를 리셋 ID별로 저장한다.
+- 이미 알린 리셋에 링크가 추가되면 해당 `message_id`에 답장하고, 답장 본문에는 리셋 ID를 노출하지 않는다.
+- 최신 리셋이 바뀐 뒤 이전 리셋이 보강되는 경우를 찾기 위해 reset 목록 API를 함께 조회한다.
+- 상태는 최신 50건으로 제한하되 아직 알리지 않은 pending 항목은 삭제하지 않는다.
+- 기존 단일 리셋 상태는 알림 완료 상태로 마이그레이션하며 기존 Telegram 메시지 ID는 없는 것으로 처리한다.
+- 여러 프로세스가 같은 상태를 읽어 중복 전송하지 않도록 비차단 파일 잠금으로 단일 실행을 보장한다.
+- 미추적 `nohup.out`은 계속 사용자 파일로 보존한다.
+- 기존 상태를 마이그레이션할 때 목록 API의 다른 과거 리셋은 `notified=true` 기준 상태로 채워 과거 알림이 대량 전송되지 않게 한다.
+- 자동 테스트는 포트 바인딩이 필요 없는 메모리 HTTP 전송 모형으로 Telegram 요청과 답장 대상을 검증한다.
+- `gofmt -w main.go main_test.go`를 실행했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go vet ./...`가 통과했다.
+- `git diff --check`가 통과했다.
+- `TELEGRAM_INTEGRATION_TEST=1 go test -run '^TestTelegramNotificationFlow$' -v`로 실제 Telegram 네 단계 알림과 이전 메시지 답장을 검증했다.
+- 실제 Telegram 테스트는 운영 `state.json`을 사용하거나 변경하지 않는다.
+
 ## 2026-08-26 KST 표시 결정
 
 - 사용자가 Telegram 메시지에 UTC와 함께 KST 시각 표시를 요청했다.

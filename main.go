@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -20,20 +21,30 @@ import (
 
 const (
 	statusURL          = "https://codex-resets.com/api/v1/status"
+	resetsURL          = "https://codex-resets.com/api/v1/resets?limit=50&order=desc"
 	stateFile          = "state.json"
+	lockFile           = ".codex-reset-monitor.lock"
 	pollInterval       = time.Minute
 	probabilityRiseMin = 20
+	resetLinkWait      = 2 * time.Minute
+	resetStateLimit    = 50
 )
 
 var kstLocation = time.FixedZone("KST", 9*60*60)
 
 type config struct {
-	botToken string
-	chatID   string
+	botToken        string
+	chatID          string
+	telegramBaseURL string
+	statePath       string
 }
 
 type statusResponse struct {
 	Data statusData `json:"data"`
+}
+
+type resetListResponse struct {
+	Data []reset `json:"data"`
 }
 
 type statusData struct {
@@ -63,17 +74,34 @@ type source struct {
 }
 
 type state struct {
-	LastResetID          string `json:"last_reset_id"`
-	LastResetType        string `json:"last_reset_type"`
-	LastResetAnnouncedAt string `json:"last_reset_announced_at"`
-	LastResetSourceType  string `json:"last_reset_source_type"`
-	LastResetURL         string `json:"last_reset_url"`
-	LastWatchObservedAt  string `json:"last_watch_observed_at"`
-	LastWatchLevel       string `json:"last_watch_level"`
-	LastWatchPercent     *int   `json:"last_watch_percent"`
+	Resets              map[string]resetState `json:"resets"`
+	LastWatchObservedAt string                `json:"last_watch_observed_at"`
+	LastWatchLevel      string                `json:"last_watch_level"`
+	LastWatchPercent    *int                  `json:"last_watch_percent"`
+	LegacyLastResetID   string                `json:"last_reset_id,omitempty"`
+	LegacyLastResetType string                `json:"last_reset_type,omitempty"`
+	LegacyAnnouncedAt   string                `json:"last_reset_announced_at,omitempty"`
+	LegacyResetSource   string                `json:"last_reset_source_type,omitempty"`
+	LegacyLastResetURL  string                `json:"last_reset_url,omitempty"`
+}
+
+type resetState struct {
+	ResetType         string    `json:"reset_type"`
+	AnnouncedAt       string    `json:"announced_at"`
+	SourceType        string    `json:"source_type"`
+	URL               string    `json:"url"`
+	FirstSeenAt       time.Time `json:"first_seen_at"`
+	Notified          bool      `json:"notified"`
+	TelegramMessageID int       `json:"telegram_message_id"`
 }
 
 func main() {
+	lock, err := acquireProcessLock(lockFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer releaseProcessLock(lock)
+
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
@@ -94,8 +122,10 @@ func loadConfig() (config, error) {
 	}
 
 	cfg := config{
-		botToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
-		chatID:   os.Getenv("TELEGRAM_CHAT_ID"),
+		botToken:        os.Getenv("TELEGRAM_BOT_TOKEN"),
+		chatID:          os.Getenv("TELEGRAM_CHAT_ID"),
+		telegramBaseURL: "https://api.telegram.org",
+		statePath:       stateFile,
 	}
 
 	if cfg.botToken == "" || cfg.chatID == "" {
@@ -174,28 +204,34 @@ func checkOnce(ctx context.Context, client *http.Client, cfg config) error {
 	if err != nil {
 		return err
 	}
-
-	current := stateFrom(data)
-	previous, exists, err := loadState(stateFile)
+	resets, err := fetchResets(ctx, client)
 	if err != nil {
 		return err
 	}
+
+	current, exists, err := loadState(cfg.statePath)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
 	if !exists {
-		if err := saveState(stateFile, current); err != nil {
+		current = baselineState(data, resets, now)
+		if err := saveState(cfg.statePath, current); err != nil {
 			return err
 		}
 		log.Print("첫 실행 기준 상태를 저장했습니다")
 		return nil
 	}
+	migrateLegacyState(&current, resets, now)
 
-	messages := notifications(previous, current, data)
-	if len(messages) > 0 {
-		if err := sendTelegram(ctx, client, cfg, strings.Join(messages, "\n\n")); err != nil {
-			return fmt.Errorf("텔레그램 전송: %w", err)
-		}
+	if err := processResets(ctx, client, cfg, &current, resets, now); err != nil {
+		return err
 	}
-
-	if err := saveState(stateFile, current); err != nil {
+	if err := processWatch(ctx, client, cfg, &current, data); err != nil {
+		return err
+	}
+	pruneResetStates(&current, resetStateLimit)
+	if err := saveState(cfg.statePath, current); err != nil {
 		return err
 	}
 	return nil
@@ -226,14 +262,37 @@ func fetchStatus(ctx context.Context, client *http.Client) (statusData, error) {
 	return result.Data, nil
 }
 
-func stateFrom(data statusData) state {
-	var result state
-	if data.LatestReset != nil {
-		result.LastResetID = data.LatestReset.ID
-		result.LastResetType = data.LatestReset.ResetType
-		result.LastResetAnnouncedAt = data.LatestReset.AnnouncedAt
-		result.LastResetSourceType = data.LatestReset.Source.Type
-		result.LastResetURL = data.LatestReset.Source.URL
+func fetchResets(ctx context.Context, client *http.Client) ([]reset, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resetsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "codex-reset-monitor/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("리셋 목록 API 응답 %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var result resetListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("리셋 목록 API JSON 해석: %w", err)
+	}
+	return result.Data, nil
+}
+
+func baselineState(data statusData, resets []reset, now time.Time) state {
+	result := state{Resets: make(map[string]resetState)}
+	for _, value := range resets {
+		item := resetStateFrom(value, now)
+		item.Notified = true
+		result.Resets[value.ID] = item
 	}
 	if data.ActiveWatch != nil {
 		result.LastWatchObservedAt = data.ActiveWatch.ObservedAt
@@ -243,46 +302,173 @@ func stateFrom(data statusData) state {
 	return result
 }
 
-func notifications(previous, current state, data statusData) []string {
-	var messages []string
-
-	if data.LatestReset != nil {
-		if current.LastResetID != previous.LastResetID {
-			messages = append(messages, resetNotification(*data.LatestReset))
-		} else {
-			if previous.LastResetURL == "" && current.LastResetURL != "" {
-				messages = append(messages, fmt.Sprintf(
-					"🔗 Codex 리셋 관련 링크가 추가되었습니다\n%s",
-					current.LastResetURL,
-				))
+func migrateLegacyState(value *state, resets []reset, now time.Time) {
+	if value.Resets == nil {
+		value.Resets = make(map[string]resetState)
+	}
+	if value.LegacyLastResetID != "" {
+		legacyID := value.LegacyLastResetID
+		value.Resets[value.LegacyLastResetID] = resetState{
+			ResetType:   value.LegacyLastResetType,
+			AnnouncedAt: value.LegacyAnnouncedAt,
+			SourceType:  value.LegacyResetSource,
+			URL:         value.LegacyLastResetURL,
+			FirstSeenAt: now,
+			Notified:    true,
+		}
+		for _, current := range resets {
+			if current.ID == legacyID {
+				continue
 			}
-			if previous.LastResetType != "" && current.LastResetType != previous.LastResetType {
-				message := fmt.Sprintf(
-					"ℹ️ Codex 리셋 종류가 변경되었습니다\n이전 종류. %s\n현재 종류. %s",
-					previous.LastResetType,
-					current.LastResetType,
-				)
-				if current.LastResetURL != "" {
-					message += "\n" + current.LastResetURL
+			item := resetStateFrom(current, now)
+			item.Notified = true
+			value.Resets[current.ID] = item
+		}
+	}
+	value.LegacyLastResetID = ""
+	value.LegacyLastResetType = ""
+	value.LegacyAnnouncedAt = ""
+	value.LegacyResetSource = ""
+	value.LegacyLastResetURL = ""
+}
+
+func resetStateFrom(value reset, firstSeenAt time.Time) resetState {
+	return resetState{
+		ResetType:   value.ResetType,
+		AnnouncedAt: value.AnnouncedAt,
+		SourceType:  value.Source.Type,
+		URL:         value.Source.URL,
+		FirstSeenAt: firstSeenAt,
+	}
+}
+
+func resetFromState(id string, value resetState) reset {
+	return reset{
+		ID:          id,
+		ResetType:   value.ResetType,
+		AnnouncedAt: value.AnnouncedAt,
+		Source: source{
+			Type: value.SourceType,
+			URL:  value.URL,
+		},
+	}
+}
+
+func processResets(ctx context.Context, client *http.Client, cfg config, current *state, resets []reset, now time.Time) error {
+	if current.Resets == nil {
+		current.Resets = make(map[string]resetState)
+	}
+
+	seen := make(map[string]bool, len(resets))
+	for index := len(resets) - 1; index >= 0; index-- {
+		value := resets[index]
+		seen[value.ID] = true
+		saved, exists := current.Resets[value.ID]
+		if !exists {
+			saved = resetStateFrom(value, now)
+			current.Resets[value.ID] = saved
+		}
+		notificationSent := false
+
+		if !saved.Notified {
+			if value.Source.URL != "" || now.Sub(saved.FirstSeenAt) >= resetLinkWait {
+				messageID, err := sendTelegram(ctx, client, cfg, resetNotification(value), 0)
+				if err != nil {
+					return fmt.Errorf("리셋 알림 전송: %w", err)
 				}
-				messages = append(messages, message)
+				saved.Notified = true
+				saved.TelegramMessageID = messageID
+				notificationSent = true
+			}
+		} else {
+			message := resetUpdateNotification(saved, value)
+			if message != "" {
+				if _, err := sendTelegram(ctx, client, cfg, message, saved.TelegramMessageID); err != nil {
+					return fmt.Errorf("리셋 업데이트 알림 전송: %w", err)
+				}
+				notificationSent = true
+			}
+		}
+
+		saved.ResetType = value.ResetType
+		saved.AnnouncedAt = value.AnnouncedAt
+		saved.SourceType = value.Source.Type
+		saved.URL = value.Source.URL
+		current.Resets[value.ID] = saved
+		if notificationSent {
+			if err := saveState(cfg.statePath, *current); err != nil {
+				return err
 			}
 		}
 	}
 
-	if data.ActiveWatch == nil {
-		return messages
+	for id, saved := range current.Resets {
+		if seen[id] || saved.Notified || now.Sub(saved.FirstSeenAt) < resetLinkWait {
+			continue
+		}
+		messageID, err := sendTelegram(ctx, client, cfg, resetNotification(resetFromState(id, saved)), 0)
+		if err != nil {
+			return fmt.Errorf("대기 중 리셋 알림 전송: %w", err)
+		}
+		saved.Notified = true
+		saved.TelegramMessageID = messageID
+		current.Resets[id] = saved
+		if err := saveState(cfg.statePath, *current); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resetUpdateNotification(previous resetState, current reset) string {
+	linkAdded := previous.URL == "" && current.Source.URL != ""
+	typeChanged := previous.ResetType != "" && previous.ResetType != current.ResetType
+	if !linkAdded && !typeChanged {
+		return ""
 	}
 
-	newWatch := current.LastWatchObservedAt != previous.LastWatchObservedAt
-	levelRaised := previous.LastWatchLevel == "elevated" && current.LastWatchLevel == "strong"
-	probabilityRaised := percentRise(previous.LastWatchPercent, current.LastWatchPercent) >= probabilityRiseMin
+	if linkAdded && !typeChanged {
+		message := "🔗 Codex 리셋 관련 링크가 추가되었습니다"
+		if previous.TelegramMessageID == 0 {
+			message += fmt.Sprintf("\n대상. %s에 감지된 %s 리셋", formatKST(current.AnnouncedAt), current.ResetType)
+		}
+		return message + "\n" + current.Source.URL
+	}
+
+	message := fmt.Sprintf(
+		"ℹ️ Codex 리셋 정보가 업데이트되었습니다\n이전 종류. %s\n현재 종류. %s",
+		previous.ResetType,
+		current.ResetType,
+	)
+	if linkAdded {
+		message += "\n관련 링크. " + current.Source.URL
+	} else if current.Source.URL != "" {
+		message += "\n" + current.Source.URL
+	}
+	return message
+}
+
+func processWatch(ctx context.Context, client *http.Client, cfg config, current *state, data statusData) error {
+	previousObservedAt := current.LastWatchObservedAt
+	previousLevel := current.LastWatchLevel
+	previousPercent := current.LastWatchPercent
+
+	if data.ActiveWatch == nil {
+		current.LastWatchObservedAt = ""
+		current.LastWatchLevel = ""
+		current.LastWatchPercent = nil
+		return nil
+	}
+
+	newWatch := data.ActiveWatch.ObservedAt != previousObservedAt
+	levelRaised := previousLevel == "elevated" && data.ActiveWatch.Level == "strong"
+	probabilityRaised := percentRise(previousPercent, data.ActiveWatch.ResetChancePercent) >= probabilityRiseMin
 	if newWatch || levelRaised || probabilityRaised {
 		percent := "미공개"
 		if data.ActiveWatch.ResetChancePercent != nil {
 			percent = fmt.Sprintf("%d%%", *data.ActiveWatch.ResetChancePercent)
 		}
-		messages = append(messages, fmt.Sprintf(
+		message := fmt.Sprintf(
 			"👀 Codex 리셋 가능성 감지\n단계. %s\n예상 확률. %s\n예측 구간. %s\n만료 시각 (UTC). %s\n만료 시각 (KST). %s\n%s",
 			data.ActiveWatch.Level,
 			percent,
@@ -290,10 +476,16 @@ func notifications(previous, current state, data statusData) []string {
 			data.ActiveWatch.ExpiresAt,
 			formatKST(data.ActiveWatch.ExpiresAt),
 			data.ActiveWatch.Source.URL,
-		))
+		)
+		if _, err := sendTelegram(ctx, client, cfg, message, 0); err != nil {
+			return fmt.Errorf("watch 알림 전송: %w", err)
+		}
 	}
 
-	return messages
+	current.LastWatchObservedAt = data.ActiveWatch.ObservedAt
+	current.LastWatchLevel = data.ActiveWatch.Level
+	current.LastWatchPercent = data.ActiveWatch.ResetChancePercent
+	return nil
 }
 
 func resetNotification(value reset) string {
@@ -341,6 +533,35 @@ func percentRise(previous, current *int) int {
 	return *current - *previous
 }
 
+func pruneResetStates(value *state, limit int) {
+	type entry struct {
+		id        string
+		timestamp time.Time
+	}
+
+	completed := make([]entry, 0, len(value.Resets))
+	for id, saved := range value.Resets {
+		if !saved.Notified {
+			continue
+		}
+		timestamp, err := time.Parse(time.RFC3339Nano, saved.AnnouncedAt)
+		if err != nil {
+			timestamp = saved.FirstSeenAt
+		}
+		completed = append(completed, entry{id: id, timestamp: timestamp})
+	}
+	if len(completed) <= limit {
+		return
+	}
+
+	sort.Slice(completed, func(i, j int) bool {
+		return completed[i].timestamp.After(completed[j].timestamp)
+	})
+	for _, item := range completed[limit:] {
+		delete(value.Resets, item.id)
+	}
+}
+
 func loadState(path string) (state, bool, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -374,32 +595,70 @@ func saveState(path string, value state) error {
 	return nil
 }
 
-func sendTelegram(ctx context.Context, client *http.Client, cfg config, text string) error {
-	payload, err := json.Marshal(map[string]any{
+func sendTelegram(ctx context.Context, client *http.Client, cfg config, text string, replyToMessageID int) (int, error) {
+	requestBody := map[string]any{
 		"chat_id":                  cfg.chatID,
 		"text":                     text,
 		"disable_web_page_preview": true,
-	})
-	if err != nil {
-		return err
+	}
+	if replyToMessageID != 0 {
+		requestBody["reply_parameters"] = map[string]any{
+			"message_id":                  replyToMessageID,
+			"allow_sending_without_reply": true,
+		}
 	}
 
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.botToken)
+	payload, err := json.Marshal(requestBody)
+	if err != nil {
+		return 0, err
+	}
+
+	url := fmt.Sprintf("%s/bot%s/sendMessage", strings.TrimRight(cfg.telegramBaseURL, "/"), cfg.botToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("Telegram API 응답 %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, err
 	}
-	return nil
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+		Result      struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, fmt.Errorf("Telegram API JSON 해석: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		return 0, fmt.Errorf("Telegram API 응답 %s: %s", resp.Status, result.Description)
+	}
+	return result.Result.MessageID, nil
+}
+
+func acquireProcessLock(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("실행 잠금 파일 열기: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, errors.New("codex-reset-monitor가 이미 실행 중입니다")
+	}
+	return file, nil
+}
+
+func releaseProcessLock(file *os.File) {
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	_ = file.Close()
 }

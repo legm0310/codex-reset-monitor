@@ -1,4 +1,5 @@
 /codex-reset-monitor
+/.codex-reset-monitor.lock
 /.env
 /state.json
 /state.json.tmp
