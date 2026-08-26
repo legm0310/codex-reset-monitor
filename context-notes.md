@@ -35,6 +35,20 @@
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
 - `git diff --check`가 통과했다.
 
+## 2026-08-26 리셋 정보 보강 정책
+
+- `x_post`는 URL이 필수지만 `observed`는 공식 발표 없이 감지될 수 있어 URL이 영구적으로 없을 수 있다.
+- 새 리셋은 URL 유무와 관계없이 즉시 알린다.
+- URL이 없으면 observed 출처와 원문 링크 없음 상태를 메시지에 명시한다.
+- 이미 알린 같은 리셋 ID에 URL이 추가되면 전체 알림 대신 링크 후속 알림을 한 번 보낸다.
+- 리셋 종류가 변경되면 변경 알림을 보내고, 발표 시각만 수정되면 상태만 갱신한다.
+- 기존 상태 파일에는 새 필드가 없으므로 Go JSON의 zero value로 읽어 마이그레이션 없이 호환한다.
+- 기존 상태에 URL 필드가 없고 현재 API에 같은 리셋의 URL이 있으면 배포 후 링크 후속 알림이 한 번 발생한다.
+- `gofmt -w main.go main_test.go`를 실행했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
+- `git diff --check`가 통과했다.
+
 ## 2026-08-26 KST 표시 결정
 
 - 사용자가 Telegram 메시지에 UTC와 함께 KST 시각 표시를 요청했다.

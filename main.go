@@ -58,14 +58,19 @@ type watch struct {
 }
 
 type source struct {
-	URL string `json:"url"`
+	Type string `json:"type"`
+	URL  string `json:"url"`
 }
 
 type state struct {
-	LastResetID         string `json:"last_reset_id"`
-	LastWatchObservedAt string `json:"last_watch_observed_at"`
-	LastWatchLevel      string `json:"last_watch_level"`
-	LastWatchPercent    *int   `json:"last_watch_percent"`
+	LastResetID          string `json:"last_reset_id"`
+	LastResetType        string `json:"last_reset_type"`
+	LastResetAnnouncedAt string `json:"last_reset_announced_at"`
+	LastResetSourceType  string `json:"last_reset_source_type"`
+	LastResetURL         string `json:"last_reset_url"`
+	LastWatchObservedAt  string `json:"last_watch_observed_at"`
+	LastWatchLevel       string `json:"last_watch_level"`
+	LastWatchPercent     *int   `json:"last_watch_percent"`
 }
 
 func main() {
@@ -225,6 +230,10 @@ func stateFrom(data statusData) state {
 	var result state
 	if data.LatestReset != nil {
 		result.LastResetID = data.LatestReset.ID
+		result.LastResetType = data.LatestReset.ResetType
+		result.LastResetAnnouncedAt = data.LatestReset.AnnouncedAt
+		result.LastResetSourceType = data.LatestReset.Source.Type
+		result.LastResetURL = data.LatestReset.Source.URL
 	}
 	if data.ActiveWatch != nil {
 		result.LastWatchObservedAt = data.ActiveWatch.ObservedAt
@@ -237,14 +246,28 @@ func stateFrom(data statusData) state {
 func notifications(previous, current state, data statusData) []string {
 	var messages []string
 
-	if data.LatestReset != nil && current.LastResetID != previous.LastResetID {
-		messages = append(messages, fmt.Sprintf(
-			"🔄 Codex 사용량 리셋 발표\n종류. %s\n발표 시각 (UTC). %s\n발표 시각 (KST). %s\n%s",
-			data.LatestReset.ResetType,
-			data.LatestReset.AnnouncedAt,
-			formatKST(data.LatestReset.AnnouncedAt),
-			data.LatestReset.Source.URL,
-		))
+	if data.LatestReset != nil {
+		if current.LastResetID != previous.LastResetID {
+			messages = append(messages, resetNotification(*data.LatestReset))
+		} else {
+			if previous.LastResetURL == "" && current.LastResetURL != "" {
+				messages = append(messages, fmt.Sprintf(
+					"🔗 Codex 리셋 관련 링크가 추가되었습니다\n%s",
+					current.LastResetURL,
+				))
+			}
+			if previous.LastResetType != "" && current.LastResetType != previous.LastResetType {
+				message := fmt.Sprintf(
+					"ℹ️ Codex 리셋 종류가 변경되었습니다\n이전 종류. %s\n현재 종류. %s",
+					previous.LastResetType,
+					current.LastResetType,
+				)
+				if current.LastResetURL != "" {
+					message += "\n" + current.LastResetURL
+				}
+				messages = append(messages, message)
+			}
+		}
 	}
 
 	if data.ActiveWatch == nil {
@@ -271,6 +294,36 @@ func notifications(previous, current state, data statusData) []string {
 	}
 
 	return messages
+}
+
+func resetNotification(value reset) string {
+	title := "🔄 Codex 사용량 리셋 발표"
+	timeLabel := "발표 시각"
+	if value.Source.Type == "observed" {
+		title = "🔄 Codex 사용량 리셋 감지"
+		timeLabel = "감지 시각"
+	}
+
+	message := fmt.Sprintf(
+		"%s\n종류. %s\n%s (UTC). %s\n%s (KST). %s",
+		title,
+		value.ResetType,
+		timeLabel,
+		value.AnnouncedAt,
+		timeLabel,
+		formatKST(value.AnnouncedAt),
+	)
+
+	if value.Source.Type == "observed" {
+		message += "\n출처. 공식 발표 없이 리셋이 관측됨"
+	}
+	if value.Source.URL == "" {
+		return message + "\n원문 링크. 없음"
+	}
+	if value.Source.Type == "observed" {
+		return message + "\n관련 링크. " + value.Source.URL
+	}
+	return message + "\n" + value.Source.URL
 }
 
 func formatKST(value string) string {
