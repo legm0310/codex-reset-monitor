@@ -4,6 +4,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -55,6 +56,9 @@ func TestNotificationsNewReset(t *testing.T) {
 	if len(messages) != 1 {
 		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
 	}
+	if !strings.Contains(messages[0], "발표 시각 (KST). 2026-08-24 09:00:00 KST") {
+		t.Fatalf("KST 발표 시각이 없습니다: %s", messages[0])
+	}
 }
 
 func TestNotificationsNewWatch(t *testing.T) {
@@ -63,12 +67,16 @@ func TestNotificationsNewWatch(t *testing.T) {
 		Level:              "elevated",
 		ResetChancePercent: &chance,
 		ObservedAt:         "2026-08-24T00:00:00Z",
+		ExpiresAt:          "2026-08-24T06:00:00Z",
 		Source:             source{URL: "https://example.com/watch"},
 	}}
 
 	messages := notifications(state{}, stateFrom(data), data)
 	if len(messages) != 1 {
 		t.Fatalf("알림 개수 = %d, 기대값 = 1", len(messages))
+	}
+	if !strings.Contains(messages[0], "만료 시각 (KST). 2026-08-24 15:00:00 KST") {
+		t.Fatalf("KST 만료 시각이 없습니다: %s", messages[0])
 	}
 }
 
@@ -157,5 +165,19 @@ func TestSaveAndLoadState(t *testing.T) {
 		got.LastWatchLevel != want.LastWatchLevel ||
 		got.LastWatchPercent == nil || *got.LastWatchPercent != chance {
 		t.Fatalf("불일치 상태 = %#v", got)
+	}
+}
+
+func TestFormatKSTCrossesDateBoundary(t *testing.T) {
+	got := formatKST("2026-08-24T16:30:00.123Z")
+	want := "2026-08-25 01:30:00 KST"
+	if got != want {
+		t.Fatalf("formatKST() = %q, 기대값 = %q", got, want)
+	}
+}
+
+func TestFormatKSTInvalidTimestamp(t *testing.T) {
+	if got := formatKST("invalid"); got != "변환 불가" {
+		t.Fatalf("formatKST() = %q, 기대값 = 변환 불가", got)
 	}
 }

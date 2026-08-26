@@ -25,6 +25,8 @@ const (
 	probabilityRiseMin = 20
 )
 
+var kstLocation = time.FixedZone("KST", 9*60*60)
+
 type config struct {
 	botToken string
 	chatID   string
@@ -237,9 +239,10 @@ func notifications(previous, current state, data statusData) []string {
 
 	if data.LatestReset != nil && current.LastResetID != previous.LastResetID {
 		messages = append(messages, fmt.Sprintf(
-			"🔄 Codex 사용량 리셋 발표\n종류. %s\n발표 시각. %s\n%s",
+			"🔄 Codex 사용량 리셋 발표\n종류. %s\n발표 시각 (UTC). %s\n발표 시각 (KST). %s\n%s",
 			data.LatestReset.ResetType,
 			data.LatestReset.AnnouncedAt,
+			formatKST(data.LatestReset.AnnouncedAt),
 			data.LatestReset.Source.URL,
 		))
 	}
@@ -257,16 +260,25 @@ func notifications(previous, current state, data statusData) []string {
 			percent = fmt.Sprintf("%d%%", *data.ActiveWatch.ResetChancePercent)
 		}
 		messages = append(messages, fmt.Sprintf(
-			"👀 Codex 리셋 가능성 감지\n단계. %s\n예상 확률. %s\n예측 구간. %s\n만료 시각. %s\n%s",
+			"👀 Codex 리셋 가능성 감지\n단계. %s\n예상 확률. %s\n예측 구간. %s\n만료 시각 (UTC). %s\n만료 시각 (KST). %s\n%s",
 			data.ActiveWatch.Level,
 			percent,
 			data.ActiveWatch.ForecastWindow,
 			data.ActiveWatch.ExpiresAt,
+			formatKST(data.ActiveWatch.ExpiresAt),
 			data.ActiveWatch.Source.URL,
 		))
 	}
 
 	return messages
+}
+
+func formatKST(value string) string {
+	timestamp, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return "변환 불가"
+	}
+	return timestamp.In(kstLocation).Format("2006-01-02 15:04:05 MST")
 }
 
 func percentRise(previous, current *int) int {

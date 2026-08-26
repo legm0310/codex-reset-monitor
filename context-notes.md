@@ -34,3 +34,15 @@
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
 - `git diff --check`가 통과했다.
+
+## 2026-08-26 KST 표시 결정
+
+- 사용자가 Telegram 메시지에 UTC와 함께 KST 시각 표시를 요청했다.
+- API 원문 UTC 시각은 유지하고 바로 다음 줄에 KST 변환 시각을 추가한다.
+- 리셋의 `announced_at`과 watch의 `expires_at` 모두 같은 형식을 적용한다.
+- KST는 서머타임이 없으므로 UTC+9 고정 시간대로 변환한다.
+- 미추적 `nohup.out`은 사용자 파일로 보고 수정하거나 커밋하지 않는다.
+- `gofmt -w main.go main_test.go`를 실행했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
+- `git diff --check`가 통과했다.
