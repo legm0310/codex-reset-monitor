@@ -70,6 +70,22 @@
 - `TELEGRAM_INTEGRATION_TEST=1 go test -run '^TestTelegramNotificationFlow$' -v`로 실제 Telegram 네 단계 알림과 이전 메시지 답장을 검증했다.
 - 실제 Telegram 테스트는 운영 `state.json`을 사용하거나 변경하지 않는다.
 
+## 2026-09-05 과거 리셋 반복 알림 원인과 수정 결정
+
+- API에서 삭제된 최신 리셋 `2095979536043401428`이 완료 상태에 남아 최신 50건 중 한 자리를 차지했다.
+- API의 50번째 과거 리셋 `1986166501435711936`은 매 조회에서 신규 상태로 추가된 뒤 시각 기준 정리에서 다시 삭제되어 1분마다 반복 알림이 발생했다.
+- 상태에 `last_reset_watermark_at`을 추가해 지금까지 처리한 가장 최신 발표 시각을 영구적으로 유지한다.
+- 상태에 없는 API 항목이 watermark 이전이면 API 복원이나 과거 이력 변경으로 간주하고 알림 없이 `notified=true`로 등록한다.
+- API가 정확히 50건을 반환했을 때만 API에 없는 완료 상태를 제거하며, 아직 알리지 않은 pending 상태는 보호한다.
+- 기존 상태에는 watermark가 없으므로 저장된 리셋 중 가장 최신 `announced_at`으로 자동 마이그레이션한다.
+- 사용자가 기존 바이너리를 중지했으며 수정된 바이너리 검증 전에는 다시 실행하지 않는다.
+- 50건 상태에 API에서 삭제된 최신 항목 하나가 남고 API의 오래된 항목 하나가 복원되는 회귀 테스트를 추가했다.
+- 복원된 과거 항목은 두 번 조회해도 알림이 없고 watermark 이후의 실제 신규 항목은 한 번 알리는 것을 검증했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go vet ./...`가 통과했다.
+- `git diff --check`가 통과했다.
+
 ## 2026-08-26 KST 표시 결정
 
 - 사용자가 Telegram 메시지에 UTC와 함께 KST 시각 표시를 요청했다.

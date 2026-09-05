@@ -74,15 +74,16 @@ type source struct {
 }
 
 type state struct {
-	Resets              map[string]resetState `json:"resets"`
-	LastWatchObservedAt string                `json:"last_watch_observed_at"`
-	LastWatchLevel      string                `json:"last_watch_level"`
-	LastWatchPercent    *int                  `json:"last_watch_percent"`
-	LegacyLastResetID   string                `json:"last_reset_id,omitempty"`
-	LegacyLastResetType string                `json:"last_reset_type,omitempty"`
-	LegacyAnnouncedAt   string                `json:"last_reset_announced_at,omitempty"`
-	LegacyResetSource   string                `json:"last_reset_source_type,omitempty"`
-	LegacyLastResetURL  string                `json:"last_reset_url,omitempty"`
+	Resets               map[string]resetState `json:"resets"`
+	LastResetWatermarkAt string                `json:"last_reset_watermark_at"`
+	LastWatchObservedAt  string                `json:"last_watch_observed_at"`
+	LastWatchLevel       string                `json:"last_watch_level"`
+	LastWatchPercent     *int                  `json:"last_watch_percent"`
+	LegacyLastResetID    string                `json:"last_reset_id,omitempty"`
+	LegacyLastResetType  string                `json:"last_reset_type,omitempty"`
+	LegacyAnnouncedAt    string                `json:"last_reset_announced_at,omitempty"`
+	LegacyResetSource    string                `json:"last_reset_source_type,omitempty"`
+	LegacyLastResetURL   string                `json:"last_reset_url,omitempty"`
 }
 
 type resetState struct {
@@ -293,6 +294,7 @@ func baselineState(data statusData, resets []reset, now time.Time) state {
 		item := resetStateFrom(value, now)
 		item.Notified = true
 		result.Resets[value.ID] = item
+		advanceResetWatermark(&result, value.AnnouncedAt)
 	}
 	if data.ActiveWatch != nil {
 		result.LastWatchObservedAt = data.ActiveWatch.ObservedAt
@@ -330,6 +332,7 @@ func migrateLegacyState(value *state, resets []reset, now time.Time) {
 	value.LegacyAnnouncedAt = ""
 	value.LegacyResetSource = ""
 	value.LegacyLastResetURL = ""
+	initializeResetWatermark(value)
 }
 
 func resetStateFrom(value reset, firstSeenAt time.Time) resetState {
@@ -358,6 +361,9 @@ func processResets(ctx context.Context, client *http.Client, cfg config, current
 	if current.Resets == nil {
 		current.Resets = make(map[string]resetState)
 	}
+	initializeResetWatermark(current)
+	reconcileCompletedResetStates(current, resets, resetStateLimit)
+	watermark, hasWatermark := parseTimestamp(current.LastResetWatermarkAt)
 
 	seen := make(map[string]bool, len(resets))
 	for index := len(resets) - 1; index >= 0; index-- {
@@ -366,6 +372,10 @@ func processResets(ctx context.Context, client *http.Client, cfg config, current
 		saved, exists := current.Resets[value.ID]
 		if !exists {
 			saved = resetStateFrom(value, now)
+			announcedAt, validTimestamp := parseTimestamp(value.AnnouncedAt)
+			if hasWatermark && (!validTimestamp || !announcedAt.After(watermark)) {
+				saved.Notified = true
+			}
 			current.Resets[value.ID] = saved
 		}
 		notificationSent := false
@@ -395,6 +405,7 @@ func processResets(ctx context.Context, client *http.Client, cfg config, current
 		saved.SourceType = value.Source.Type
 		saved.URL = value.Source.URL
 		current.Resets[value.ID] = saved
+		advanceResetWatermark(current, value.AnnouncedAt)
 		if notificationSent {
 			if err := saveState(cfg.statePath, *current); err != nil {
 				return err
@@ -418,6 +429,51 @@ func processResets(ctx context.Context, client *http.Client, cfg config, current
 		}
 	}
 	return nil
+}
+
+func reconcileCompletedResetStates(current *state, resets []reset, expectedCount int) {
+	if len(resets) != expectedCount {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(resets))
+	for _, value := range resets {
+		seen[value.ID] = struct{}{}
+	}
+	if len(seen) != expectedCount {
+		return
+	}
+
+	for id, saved := range current.Resets {
+		if _, exists := seen[id]; !exists && saved.Notified {
+			delete(current.Resets, id)
+		}
+	}
+}
+
+func initializeResetWatermark(current *state) {
+	if current.LastResetWatermarkAt != "" {
+		return
+	}
+	for _, saved := range current.Resets {
+		advanceResetWatermark(current, saved.AnnouncedAt)
+	}
+}
+
+func advanceResetWatermark(current *state, announcedAt string) {
+	candidate, validCandidate := parseTimestamp(announcedAt)
+	if !validCandidate {
+		return
+	}
+	watermark, validWatermark := parseTimestamp(current.LastResetWatermarkAt)
+	if !validWatermark || candidate.After(watermark) {
+		current.LastResetWatermarkAt = announcedAt
+	}
+}
+
+func parseTimestamp(value string) (time.Time, bool) {
+	timestamp, err := time.Parse(time.RFC3339Nano, value)
+	return timestamp, err == nil
 }
 
 func resetUpdateNotification(previous resetState, current reset) string {

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -212,6 +213,74 @@ func TestPruneResetStatesKeepsLatestFiftyAndPending(t *testing.T) {
 	}
 }
 
+func TestProcessResetsSilentlyReconcilesOldResetAtRetentionBoundary(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(filepath.Join(t.TempDir(), "state.json"))
+	base := time.Date(2025, 11, 5, 20, 19, 29, 0, time.UTC)
+	apiResets := make([]reset, 0, resetStateLimit)
+	current := state{Resets: make(map[string]resetState)}
+
+	for index := 0; index < resetStateLimit; index++ {
+		announcedAt := base.Add(time.Duration(index) * 24 * time.Hour)
+		value := reset{
+			ID:          fmt.Sprintf("api-%02d", index),
+			ResetType:   "regular",
+			AnnouncedAt: announcedAt.Format(time.RFC3339),
+			Source:      source{Type: "x_post", URL: fmt.Sprintf("https://example.com/api-%02d", index)},
+		}
+		apiResets = append(apiResets, value)
+		if index > 0 {
+			item := resetStateFrom(value, base)
+			item.Notified = true
+			current.Resets[value.ID] = item
+		}
+	}
+	current.Resets["removed-upstream"] = resetState{
+		ResetType:   "banked",
+		AnnouncedAt: base.Add(48*time.Hour + time.Hour).Format(time.RFC3339),
+		SourceType:  "x_post",
+		URL:         "https://example.com/removed-upstream",
+		FirstSeenAt: base,
+		Notified:    true,
+	}
+	current.LastResetWatermarkAt = apiResets[len(apiResets)-1].AnnouncedAt
+
+	if err := processResets(context.Background(), client, cfg, &current, apiResets, base.Add(60*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	pruneResetStates(&current, resetStateLimit)
+	if len(*requests) != 0 {
+		t.Fatalf("복원된 과거 리셋이 알림으로 전송됐습니다: %#v", *requests)
+	}
+	if _, exists := current.Resets["removed-upstream"]; exists {
+		t.Fatal("API에서 삭제된 완료 상태가 남아 있습니다")
+	}
+	if restored, exists := current.Resets["api-00"]; !exists || !restored.Notified {
+		t.Fatalf("과거 리셋이 기준 상태로 등록되지 않았습니다: %#v", restored)
+	}
+
+	if err := processResets(context.Background(), client, cfg, &current, apiResets, base.Add(60*24*time.Hour+time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("다음 조회에서 과거 리셋 알림이 반복됐습니다: %#v", *requests)
+	}
+
+	newReset := reset{
+		ID:          "new-reset",
+		ResetType:   "regular",
+		AnnouncedAt: base.Add(60 * 24 * time.Hour).Format(time.RFC3339),
+		Source:      source{Type: "x_post", URL: "https://example.com/new-reset"},
+	}
+	apiResets = append(apiResets[1:], newReset)
+	if err := processResets(context.Background(), client, cfg, &current, apiResets, base.Add(61*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 || !strings.Contains((*requests)[0].Text, "new-reset") {
+		t.Fatalf("실제 신규 리셋 알림이 올바르지 않습니다: %#v", *requests)
+	}
+}
+
 func TestMigrateLegacyState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	legacy := `{"last_reset_id":"123","last_reset_type":"regular","last_reset_url":"","last_watch_level":"strong","last_watch_percent":80}`
@@ -222,7 +291,7 @@ func TestMigrateLegacyState(t *testing.T) {
 	if err != nil || !exists {
 		t.Fatalf("기존 상태 읽기 실패: %v", err)
 	}
-	apiResets := []reset{{ID: "456", ResetType: "regular", Source: source{Type: "x_post", URL: "https://example.com/456"}}}
+	apiResets := []reset{{ID: "456", ResetType: "regular", AnnouncedAt: "2026-08-26T00:00:00Z", Source: source{Type: "x_post", URL: "https://example.com/456"}}}
 	migrateLegacyState(&got, apiResets, time.Now().UTC())
 	migrated, exists := got.Resets["123"]
 	if !exists || !migrated.Notified || migrated.ResetType != "regular" {
@@ -234,11 +303,14 @@ func TestMigrateLegacyState(t *testing.T) {
 	if baseline, exists := got.Resets["456"]; !exists || !baseline.Notified {
 		t.Fatalf("기존 이력이 기준 상태로 채워지지 않았습니다: %#v", got)
 	}
+	if got.LastResetWatermarkAt != "2026-08-26T00:00:00Z" {
+		t.Fatalf("watermark 자동 마이그레이션 실패: %q", got.LastResetWatermarkAt)
+	}
 }
 
 func TestSaveAndLoadState(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	want := state{Resets: map[string]resetState{
+	want := state{LastResetWatermarkAt: now.Format(time.RFC3339), Resets: map[string]resetState{
 		"123": {
 			ResetType:         "regular",
 			AnnouncedAt:       now.Format(time.RFC3339),
@@ -257,7 +329,7 @@ func TestSaveAndLoadState(t *testing.T) {
 	if err != nil || !exists {
 		t.Fatalf("상태 읽기 실패: %v", err)
 	}
-	if got.Resets["123"].TelegramMessageID != 100 || got.Resets["123"].URL != "https://example.com/reset" {
+	if got.Resets["123"].TelegramMessageID != 100 || got.Resets["123"].URL != "https://example.com/reset" || got.LastResetWatermarkAt != want.LastResetWatermarkAt {
 		t.Fatalf("불일치 상태: %#v", got)
 	}
 }
