@@ -97,3 +97,33 @@
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
 - `git diff --check`가 통과했다.
+
+## 2026-10-23 사용자 계정 리셋 조기 감지 결정
+
+- 공식 발표보다 사용자 계정에 리셋이 먼저 반영되는 경우를 찾기 위해 로컬 `codex app-server`의 `account/rateLimits/read`를 읽는다.
+- 인증 토큰은 직접 읽거나 저장하지 않고 Codex CLI가 보유한 로그인 세션만 사용한다.
+- 계정 ID 원문은 저장하지 않고 SHA-256 지문만 `state.json`에 저장한다.
+- app-server 조회 실패는 공개 API 감시를 중단시키지 않고 해당 주기의 계정 감지만 건너뛴다.
+- 첫 조회와 계정, 플랜, 제한 ID 변경은 기준선만 저장하고 알리지 않는다.
+- 제한 버킷의 primary와 secondary 중 24시간 이상이면서 가장 긴 window를 주간 제한으로 선택하고, `used_percent`가 자연 갱신 시각 5분 전보다 이른 시점에 15%p 이상 감소하면 후보로 만든다.
+- 오탐을 줄이기 위해 같은 감소 상태가 다음 조회에서도 유지될 때 계정 리셋으로 확정한다.
+- reset credit이 감소하면서 사용률이 낮아진 경우는 사용자가 banked reset을 소비한 것으로 보고 일반 리셋 알림을 만들지 않는다.
+- reset credit 증가 자체는 banked 리셋 증거로 기록하며 banked 공식 발표와만 매핑한다.
+- regular 공식 발표는 계정 감지 시각 기준 12시간 전부터 24시간 후까지의 미매핑 후보가 정확히 하나일 때만 자동 매핑한다.
+- 후보가 없으면 기다리고 둘 이상이면 모호한 상태로 남겨 잘못된 자동 답장을 피한다.
+- 계정 감지가 먼저면 계정 전용 문구로 알린 뒤 공식 발표 링크를 기존 메시지에 답장한다.
+- 공식 발표가 먼저면 기존 발표 메시지에 사용자 계정 반영 확인을 답장한다.
+- 같은 조회에서 두 증거가 처음 확인되면 중복 없이 하나의 결합 메시지를 보낸다.
+- 계정 이벤트 상태도 완료 항목 최신 50건만 유지하고 미확정 후보는 정리 대상에서 제외한다.
+- 새 기능은 기본 활성화하되 `CODEX_USAGE_MONITOR_ENABLED=false`로 끌 수 있고 `CODEX_BINARY`로 CLI 경로를 지정할 수 있게 한다.
+- 실제 설치된 Codex CLI 0.163.0 응답에서는 `codex` 버킷의 10,080분 주간 제한이 secondary가 아니라 primary에 있었다. 특정 필드 위치를 가정하지 않고 가장 긴 주간 window를 고른다.
+- banked reset 크레딧 차감과 사용률 감소가 서로 다른 조회에서 반영될 수 있으므로 차감 후 5분간 감소를 일반 리셋 후보에서 제외한다.
+- 계정 감지와 공식 발표 중 후보가 둘 이상인 방향은 모두 자동 매핑하지 않는다.
+- 계정 사용량 알림 직후 상태를 저장해 이후 공개 API 처리 실패가 발생해도 같은 계정 알림이 반복되지 않게 한다.
+- app-server RPC 요청·주간 창 선택, 기준선·식별자 변경, 2회 확인, 자연 갱신 제외, banked 지급·사용, 양방향·동시·모호 매핑, 상태 정리·보안, 실패 격리를 각각 독립 테스트했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test -race ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go vet ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
+- `CODEX_USAGE_INTEGRATION_TEST=1` 통합 테스트에서 실제 로컬 계정의 `codex` 10,080분 제한을 읽었고 Telegram 메시지는 전송하지 않았다.
+- 실행용 `codex-reset-monitor` 바이너리를 최종 소스로 다시 빌드했으며 `.gitignore` 정책에 따라 커밋 대상에서는 제외한다.

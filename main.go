@@ -37,6 +37,8 @@ type config struct {
 	chatID          string
 	telegramBaseURL string
 	statePath       string
+	usageEnabled    bool
+	codexBinary     string
 }
 
 type statusResponse struct {
@@ -74,16 +76,19 @@ type source struct {
 }
 
 type state struct {
-	Resets               map[string]resetState `json:"resets"`
-	LastResetWatermarkAt string                `json:"last_reset_watermark_at"`
-	LastWatchObservedAt  string                `json:"last_watch_observed_at"`
-	LastWatchLevel       string                `json:"last_watch_level"`
-	LastWatchPercent     *int                  `json:"last_watch_percent"`
-	LegacyLastResetID    string                `json:"last_reset_id,omitempty"`
-	LegacyLastResetType  string                `json:"last_reset_type,omitempty"`
-	LegacyAnnouncedAt    string                `json:"last_reset_announced_at,omitempty"`
-	LegacyResetSource    string                `json:"last_reset_source_type,omitempty"`
-	LegacyLastResetURL   string                `json:"last_reset_url,omitempty"`
+	Resets               map[string]resetState        `json:"resets"`
+	AccountUsage         *accountUsageState           `json:"account_usage,omitempty"`
+	PendingAccountReset  *accountResetCandidate       `json:"pending_account_reset,omitempty"`
+	AccountResets        map[string]accountResetState `json:"account_resets,omitempty"`
+	LastResetWatermarkAt string                       `json:"last_reset_watermark_at"`
+	LastWatchObservedAt  string                       `json:"last_watch_observed_at"`
+	LastWatchLevel       string                       `json:"last_watch_level"`
+	LastWatchPercent     *int                         `json:"last_watch_percent"`
+	LegacyLastResetID    string                       `json:"last_reset_id,omitempty"`
+	LegacyLastResetType  string                       `json:"last_reset_type,omitempty"`
+	LegacyAnnouncedAt    string                       `json:"last_reset_announced_at,omitempty"`
+	LegacyResetSource    string                       `json:"last_reset_source_type,omitempty"`
+	LegacyLastResetURL   string                       `json:"last_reset_url,omitempty"`
 }
 
 type resetState struct {
@@ -94,6 +99,7 @@ type resetState struct {
 	FirstSeenAt       time.Time `json:"first_seen_at"`
 	Notified          bool      `json:"notified"`
 	TelegramMessageID int       `json:"telegram_message_id"`
+	AccountResetID    string    `json:"account_reset_id,omitempty"`
 }
 
 func main() {
@@ -127,6 +133,8 @@ func loadConfig() (config, error) {
 		chatID:          os.Getenv("TELEGRAM_CHAT_ID"),
 		telegramBaseURL: "https://api.telegram.org",
 		statePath:       stateFile,
+		usageEnabled:    envEnabled("CODEX_USAGE_MONITOR_ENABLED", true),
+		codexBinary:     envOrDefault("CODEX_BINARY", "codex"),
 	}
 
 	if cfg.botToken == "" || cfg.chatID == "" {
@@ -181,7 +189,11 @@ func loadDotEnv(path string) error {
 }
 
 func monitor(ctx context.Context, client *http.Client, cfg config) error {
-	if err := checkOnce(ctx, client, cfg); err != nil {
+	var usageReader accountUsageReader
+	if cfg.usageEnabled {
+		usageReader = codexAppServerReader{binary: cfg.codexBinary}
+	}
+	if err := checkOnceWithUsage(ctx, client, cfg, usageReader); err != nil {
 		log.Printf("초기 조회 실패: %v", err)
 	}
 
@@ -193,7 +205,7 @@ func monitor(ctx context.Context, client *http.Client, cfg config) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := checkOnce(ctx, client, cfg); err != nil {
+			if err := checkOnceWithUsage(ctx, client, cfg, usageReader); err != nil {
 				log.Printf("상태 조회 실패: %v", err)
 			}
 		}
@@ -201,6 +213,10 @@ func monitor(ctx context.Context, client *http.Client, cfg config) error {
 }
 
 func checkOnce(ctx context.Context, client *http.Client, cfg config) error {
+	return checkOnceWithUsage(ctx, client, cfg, nil)
+}
+
+func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, usageReader accountUsageReader) error {
 	data, err := fetchStatus(ctx, client)
 	if err != nil {
 		return err
@@ -215,8 +231,20 @@ func checkOnce(ctx context.Context, client *http.Client, cfg config) error {
 		return err
 	}
 	now := time.Now().UTC()
+	var usage *accountUsageSnapshot
+	if usageReader != nil {
+		value, readErr := usageReader.Read(ctx)
+		if readErr != nil {
+			log.Printf("Codex 계정 사용량 조회 실패, 공개 API 감시는 계속합니다: %v", readErr)
+		} else {
+			usage = &value
+		}
+	}
 	if !exists {
 		current = baselineState(data, resets, now)
+		if usage != nil {
+			setAccountUsageBaseline(&current, *usage)
+		}
 		if err := saveState(cfg.statePath, current); err != nil {
 			return err
 		}
@@ -224,6 +252,32 @@ func checkOnce(ctx context.Context, client *http.Client, cfg config) error {
 		return nil
 	}
 	migrateLegacyState(&current, resets, now)
+	if usage != nil {
+		pendingCreated, processErr := processAccountUsage(ctx, client, cfg, &current, *usage, resets, now)
+		if processErr != nil {
+			return processErr
+		}
+		if err := saveState(cfg.statePath, current); err != nil {
+			return err
+		}
+		if pendingCreated {
+			timer := time.NewTimer(accountConfirmationDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			confirmed, readErr := usageReader.Read(ctx)
+			if readErr != nil {
+				log.Printf("Codex 계정 리셋 재확인 실패, 다음 조회에서 재시도합니다: %v", readErr)
+			} else if _, processErr := processAccountUsage(ctx, client, cfg, &current, confirmed, resets, time.Now().UTC()); processErr != nil {
+				return processErr
+			} else if err := saveState(cfg.statePath, current); err != nil {
+				return err
+			}
+		}
+	}
 
 	if err := processResets(ctx, client, cfg, &current, resets, now); err != nil {
 		return err
@@ -232,6 +286,7 @@ func checkOnce(ctx context.Context, client *http.Client, cfg config) error {
 		return err
 	}
 	pruneResetStates(&current, resetStateLimit)
+	pruneAccountResetStates(&current, resetStateLimit)
 	if err := saveState(cfg.statePath, current); err != nil {
 		return err
 	}
@@ -379,6 +434,22 @@ func processResets(ctx context.Context, client *http.Client, cfg config, current
 			current.Resets[value.ID] = saved
 		}
 		notificationSent := false
+		if !saved.Notified {
+			accountResetID, accountEvent, matchCount := findAccountMatch(*current, value)
+			if matchCount == 1 {
+				accountEvent.OfficialResetID = value.ID
+				current.AccountResets[accountResetID] = accountEvent
+				saved.AccountResetID = accountResetID
+				saved.Notified = true
+				saved.TelegramMessageID = accountEvent.TelegramMessageID
+				if value.Source.URL != "" {
+					if _, err := sendTelegram(ctx, client, cfg, officialMatchedNotification(value), accountEvent.TelegramMessageID); err != nil {
+						return fmt.Errorf("공식 발표 매핑 답장 전송: %w", err)
+					}
+					notificationSent = true
+				}
+			}
+		}
 
 		if !saved.Notified {
 			if value.Source.URL != "" || now.Sub(saved.FirstSeenAt) >= resetLinkWait {
