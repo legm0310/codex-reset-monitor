@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -24,11 +25,14 @@ const (
 	accountConfirmationDelay = 20 * time.Second
 	accountUsageTimeout      = 10 * time.Second
 	accountResetDropMin      = 15
-	naturalResetGrace        = 5 * time.Minute
-	accountMatchBefore       = 12 * time.Hour
+	accountMatchBefore       = 36 * time.Hour
 	accountMatchAfter        = 24 * time.Hour
 	bankedUseSuppression     = 5 * time.Minute
 	weeklyWindowMinMinutes   = 24 * 60
+	accountHistoryLimit      = 20
+	freshWindowUsageMax      = 5
+	windowStartTolerance     = 10 * time.Minute
+	windowAdvanceMin         = 30 * time.Minute
 )
 
 type accountUsageReader interface {
@@ -69,6 +73,9 @@ type accountResetCandidate struct {
 	PreviousResetsAt    int64     `json:"previous_resets_at"`
 	CurrentResetsAt     int64     `json:"current_resets_at"`
 	FirstObservedAt     time.Time `json:"first_observed_at"`
+	UsageDropSignal     bool      `json:"usage_drop_signal,omitempty"`
+	NewWindowSignal     bool      `json:"new_window_signal,omitempty"`
+	DetectionReason     string    `json:"detection_reason,omitempty"`
 }
 
 type accountResetState struct {
@@ -87,6 +94,16 @@ type accountResetState struct {
 	MappingAmbiguous    bool      `json:"mapping_ambiguous,omitempty"`
 	Notified            bool      `json:"notified"`
 	TelegramMessageID   int       `json:"telegram_message_id"`
+	DetectionReason     string    `json:"detection_reason,omitempty"`
+}
+
+type accountUsageObservation struct {
+	ObservedAt         time.Time `json:"observed_at"`
+	UsedPercent        int       `json:"used_percent"`
+	ResetsAt           int64     `json:"resets_at"`
+	WindowDurationMins int64     `json:"window_duration_mins"`
+	ResetCredits       *int64    `json:"reset_credits,omitempty"`
+	Outcome            string    `json:"outcome"`
 }
 
 type appServerRateLimitWindow struct {
@@ -321,8 +338,14 @@ func processAccountUsage(ctx context.Context, client *http.Client, cfg config, c
 		current.AccountResets = make(map[string]accountResetState)
 	}
 	if current.AccountUsage == nil || accountIdentityChanged(*current.AccountUsage, snapshot) {
+		outcome := "baseline"
+		if current.AccountUsage != nil {
+			outcome = "identity_changed"
+			log.Printf("Codex 계정 사용량 기준선 변경: account, plan 또는 limit ID가 변경됐습니다")
+		}
 		setAccountUsageBaseline(current, snapshot)
 		current.PendingAccountReset = nil
+		recordAccountObservation(current, snapshot, now, outcome)
 		return false, nil
 	}
 
@@ -333,16 +356,29 @@ func processAccountUsage(ctx context.Context, client *http.Client, cfg config, c
 	if creditsDecreased(previous.ResetCredits, snapshot.ResetCredits) {
 		current.PendingAccountReset = nil
 		nextBaseline.SuppressDropUntil = now.Add(bankedUseSuppression)
+		recordAccountObservation(current, snapshot, now, "banked_credit_used")
+		log.Printf("Codex 계정 regular 리셋 판정 제외: banked reset 크레딧 감소")
 		return false, nil
 	}
+
+	bankedGranted := false
 	if creditsIncreased(previous.ResetCredits, snapshot.ResetCredits) {
-		current.PendingAccountReset = nil
 		event := newAccountResetState("banked", previous, snapshot, now)
-		return false, notifyAccountReset(ctx, client, cfg, current, event, resets)
+		event.DetectionReason = "banked_credit_increase"
+		if err := notifyAccountReset(ctx, client, cfg, current, event, resets); err != nil {
+			return false, err
+		}
+		bankedGranted = true
+		log.Printf("Codex 계정 banked reset 지급 확정: credits %s -> %s", formatOptionalInt(previous.ResetCredits), formatOptionalInt(snapshot.ResetCredits))
 	}
 
 	if candidate := current.PendingAccountReset; candidate != nil {
-		if candidateConfirmed(*candidate, snapshot) {
+		if !candidate.UsageDropSignal && !candidate.NewWindowSignal {
+			candidate.UsageDropSignal = candidate.PreviousUsedPercent-candidate.CurrentUsedPercent >= accountResetDropMin
+			candidate.DetectionReason = resetDetectionReason(candidate.UsageDropSignal, candidate.NewWindowSignal)
+		}
+		usageDropConfirmed, newWindowConfirmed := candidateConfirmedSignals(*candidate, snapshot)
+		if usageDropConfirmed || newWindowConfirmed {
 			current.PendingAccountReset = nil
 			event := accountResetState{
 				ResetType:           "regular",
@@ -356,17 +392,64 @@ func processAccountUsage(ctx context.Context, client *http.Client, cfg config, c
 				CurrentResetsAt:     snapshot.ResetsAt,
 				PreviousCredits:     cloneInt64(previous.ResetCredits),
 				CurrentCredits:      cloneInt64(snapshot.ResetCredits),
+				DetectionReason:     resetDetectionReason(usageDropConfirmed, newWindowConfirmed),
 			}
-			return false, notifyAccountReset(ctx, client, cfg, current, event, resets)
+			if err := notifyAccountReset(ctx, client, cfg, current, event, resets); err != nil {
+				return false, err
+			}
+			recordAccountObservation(current, snapshot, now, "candidate_confirmed:"+event.DetectionReason)
+			log.Printf("Codex 계정 regular 리셋 확정: reason=%s used=%d%%->%d%% resets_at=%d->%d", event.DetectionReason, event.PreviousUsedPercent, event.CurrentUsedPercent, event.PreviousResetsAt, event.CurrentResetsAt)
+			return false, nil
 		}
 		current.PendingAccountReset = nil
-	}
-
-	drop := previous.UsedPercent - snapshot.UsedPercent
-	if now.Before(previous.SuppressDropUntil) || drop < accountResetDropMin || previous.ResetsAt == 0 || isNaturalReset(previous.ResetsAt, now) {
+		candidateBaseline := accountUsageState{
+			AccountFingerprint: candidate.AccountFingerprint,
+			LimitID:            candidate.LimitID,
+			PlanType:           candidate.PlanType,
+			UsedPercent:        candidate.PreviousUsedPercent,
+			ResetsAt:           candidate.PreviousResetsAt,
+			WindowDurationMins: snapshot.WindowDurationMins,
+			ResetCredits:       cloneInt64(previous.ResetCredits),
+		}
+		usageDropSignal, newWindowSignal := accountResetSignals(candidateBaseline, snapshot, now)
+		if usageDropSignal || newWindowSignal {
+			reason := resetDetectionReason(usageDropSignal, newWindowSignal)
+			current.PendingAccountReset = newAccountResetCandidate(candidateBaseline, snapshot, now, usageDropSignal, newWindowSignal)
+			recordAccountObservation(current, snapshot, now, "candidate_replaced:"+reason)
+			log.Printf("Codex 계정 regular 리셋 후보 교체: reason=%s used=%d%%->%d%% resets_at=%d->%d", reason, candidate.PreviousUsedPercent, snapshot.UsedPercent, candidate.PreviousResetsAt, snapshot.ResetsAt)
+			return true, nil
+		}
+		recordAccountObservation(current, snapshot, now, "candidate_rejected")
+		log.Printf("Codex 계정 regular 리셋 후보 취소: 재확인 조건 불충족, used=%d%% resets_at=%d", snapshot.UsedPercent, snapshot.ResetsAt)
 		return false, nil
 	}
-	current.PendingAccountReset = &accountResetCandidate{
+
+	if now.Before(previous.SuppressDropUntil) {
+		recordAccountObservation(current, snapshot, now, "banked_use_suppression")
+		return false, nil
+	}
+	usageDropSignal, newWindowSignal := accountResetSignals(previous, snapshot, now)
+	if !usageDropSignal && !newWindowSignal {
+		outcome := "normal"
+		if bankedGranted {
+			outcome = "banked_grant"
+		}
+		recordAccountObservation(current, snapshot, now, outcome)
+		return false, nil
+	}
+	reason := resetDetectionReason(usageDropSignal, newWindowSignal)
+	current.PendingAccountReset = newAccountResetCandidate(previous, snapshot, now, usageDropSignal, newWindowSignal)
+	outcome := "candidate_created:" + reason
+	if bankedGranted {
+		outcome += "+banked_grant"
+	}
+	recordAccountObservation(current, snapshot, now, outcome)
+	log.Printf("Codex 계정 regular 리셋 후보 생성: reason=%s used=%d%%->%d%% resets_at=%d->%d", reason, previous.UsedPercent, snapshot.UsedPercent, previous.ResetsAt, snapshot.ResetsAt)
+	return true, nil
+}
+
+func newAccountResetCandidate(previous accountUsageState, snapshot accountUsageSnapshot, now time.Time, usageDropSignal, newWindowSignal bool) *accountResetCandidate {
+	return &accountResetCandidate{
 		AccountFingerprint:  snapshot.AccountFingerprint,
 		LimitID:             snapshot.LimitID,
 		PlanType:            snapshot.PlanType,
@@ -375,8 +458,10 @@ func processAccountUsage(ctx context.Context, client *http.Client, cfg config, c
 		PreviousResetsAt:    previous.ResetsAt,
 		CurrentResetsAt:     snapshot.ResetsAt,
 		FirstObservedAt:     now,
+		UsageDropSignal:     usageDropSignal,
+		NewWindowSignal:     newWindowSignal,
+		DetectionReason:     resetDetectionReason(usageDropSignal, newWindowSignal),
 	}
-	return true, nil
 }
 
 func notifyAccountReset(ctx context.Context, client *http.Client, cfg config, current *state, event accountResetState, resets []reset) error {
@@ -445,16 +530,56 @@ func accountUsageStateFrom(snapshot accountUsageSnapshot) accountUsageState {
 	}
 }
 
-func candidateConfirmed(candidate accountResetCandidate, snapshot accountUsageSnapshot) bool {
-	return candidate.AccountFingerprint == snapshot.AccountFingerprint &&
-		candidate.LimitID == snapshot.LimitID &&
-		candidate.PlanType == snapshot.PlanType &&
-		candidate.CurrentResetsAt == snapshot.ResetsAt &&
-		candidate.PreviousUsedPercent-snapshot.UsedPercent >= accountResetDropMin
+func accountResetSignals(previous accountUsageState, snapshot accountUsageSnapshot, now time.Time) (bool, bool) {
+	usageDrop := previous.UsedPercent-snapshot.UsedPercent >= accountResetDropMin
+	newWindow := resetWindowStarted(previous.ResetsAt, snapshot, now)
+	return usageDrop, newWindow
 }
 
-func isNaturalReset(previousResetsAt int64, now time.Time) bool {
-	return previousResetsAt > 0 && !now.Before(time.Unix(previousResetsAt, 0).Add(-naturalResetGrace))
+func candidateConfirmedSignals(candidate accountResetCandidate, snapshot accountUsageSnapshot) (bool, bool) {
+	if candidate.AccountFingerprint != snapshot.AccountFingerprint || candidate.LimitID != snapshot.LimitID || candidate.PlanType != snapshot.PlanType {
+		return false, false
+	}
+	usageDrop := candidate.UsageDropSignal && candidate.PreviousUsedPercent-snapshot.UsedPercent >= accountResetDropMin
+	windowStartedAt, validWindow := usageWindowStartedAt(snapshot)
+	newWindow := candidate.NewWindowSignal && validWindow && snapshot.UsedPercent <= freshWindowUsageMax &&
+		snapshot.ResetsAt >= candidate.PreviousResetsAt+int64(windowAdvanceMin/time.Second) &&
+		absDuration(windowStartedAt.Sub(candidate.FirstObservedAt)) <= windowStartTolerance+accountConfirmationDelay
+	return usageDrop, newWindow
+}
+
+func resetWindowStarted(previousResetsAt int64, snapshot accountUsageSnapshot, now time.Time) bool {
+	windowStartedAt, valid := usageWindowStartedAt(snapshot)
+	return valid && previousResetsAt > 0 && snapshot.UsedPercent <= freshWindowUsageMax &&
+		snapshot.ResetsAt >= previousResetsAt+int64(windowAdvanceMin/time.Second) &&
+		absDuration(windowStartedAt.Sub(now)) <= windowStartTolerance
+}
+
+func usageWindowStartedAt(snapshot accountUsageSnapshot) (time.Time, bool) {
+	if snapshot.ResetsAt <= 0 || snapshot.WindowDurationMins <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(snapshot.ResetsAt, 0).Add(-time.Duration(snapshot.WindowDurationMins) * time.Minute), true
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func resetDetectionReason(usageDrop, newWindow bool) string {
+	switch {
+	case usageDrop && newWindow:
+		return "usage_drop_and_new_window"
+	case usageDrop:
+		return "usage_drop"
+	case newWindow:
+		return "new_window"
+	default:
+		return "unknown"
+	}
 }
 
 func creditsIncreased(previous, current *int64) bool {
@@ -500,6 +625,20 @@ func cloneInt64(value *int64) *int64 {
 	}
 	copy := *value
 	return &copy
+}
+
+func recordAccountObservation(current *state, snapshot accountUsageSnapshot, observedAt time.Time, outcome string) {
+	current.AccountUsageHistory = append(current.AccountUsageHistory, accountUsageObservation{
+		ObservedAt:         observedAt,
+		UsedPercent:        snapshot.UsedPercent,
+		ResetsAt:           snapshot.ResetsAt,
+		WindowDurationMins: snapshot.WindowDurationMins,
+		ResetCredits:       cloneInt64(snapshot.ResetCredits),
+		Outcome:            outcome,
+	})
+	if len(current.AccountUsageHistory) > accountHistoryLimit {
+		current.AccountUsageHistory = append([]accountUsageObservation(nil), current.AccountUsageHistory[len(current.AccountUsageHistory)-accountHistoryLimit:]...)
+	}
 }
 
 func findOfficialMatch(current state, event accountResetState, resets []reset) (reset, int) {
@@ -560,7 +699,11 @@ func accountResetNotification(event accountResetState) string {
 		title = "🏦 내 Codex 계정 banked reset 지급 감지"
 		detail = fmt.Sprintf("사용 가능 크레딧. %s → %s", formatOptionalInt(event.PreviousCredits), formatOptionalInt(event.CurrentCredits))
 	}
-	return fmt.Sprintf("%s\n종류. %s\n%s\n감지 시각 (UTC). %s\n감지 시각 (KST). %s\n공식 발표. 확인 대기 중", title, event.ResetType, detail, event.DetectedAt.UTC().Format(time.RFC3339), formatKST(event.DetectedAt.UTC().Format(time.RFC3339)))
+	reason := ""
+	if event.DetectionReason != "" {
+		reason = "\n감지 근거. " + detectionReasonLabel(event.DetectionReason)
+	}
+	return fmt.Sprintf("%s\n종류. %s\n%s%s\n감지 시각 (UTC). %s\n감지 시각 (KST). %s\n공식 발표. 확인 대기 중", title, event.ResetType, detail, reason, event.DetectedAt.UTC().Format(time.RFC3339), formatKST(event.DetectedAt.UTC().Format(time.RFC3339)))
 }
 
 func combinedAccountNotification(event accountResetState, official reset) string {
@@ -576,7 +719,22 @@ func accountAppliedNotification(event accountResetState) string {
 	if event.ResetType == "banked" {
 		return fmt.Sprintf("✅ 내 Codex 계정에 banked reset 지급이 확인되었습니다\n사용 가능 크레딧. %s → %s\n확인 시각 (KST). %s", formatOptionalInt(event.PreviousCredits), formatOptionalInt(event.CurrentCredits), formatKST(event.DetectedAt.UTC().Format(time.RFC3339)))
 	}
-	return fmt.Sprintf("✅ 내 Codex 계정에 리셋 반영이 확인되었습니다\n주간 사용량. %d%% → %d%%\n확인 시각 (KST). %s", event.PreviousUsedPercent, event.CurrentUsedPercent, formatKST(event.DetectedAt.UTC().Format(time.RFC3339)))
+	return fmt.Sprintf("✅ 내 Codex 계정에 리셋 반영이 확인되었습니다\n주간 사용량. %d%% → %d%%\n감지 근거. %s\n확인 시각 (KST). %s", event.PreviousUsedPercent, event.CurrentUsedPercent, detectionReasonLabel(event.DetectionReason), formatKST(event.DetectedAt.UTC().Format(time.RFC3339)))
+}
+
+func detectionReasonLabel(reason string) string {
+	switch reason {
+	case "usage_drop_and_new_window":
+		return "사용률 급감 및 새 사용량 창"
+	case "usage_drop":
+		return "사용률 급감"
+	case "new_window":
+		return "새 사용량 창"
+	case "banked_credit_increase":
+		return "banked reset 크레딧 증가"
+	default:
+		return "계정 사용량 변화"
+	}
 }
 
 func officialMatchedNotification(value reset) string {

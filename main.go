@@ -77,7 +77,9 @@ type source struct {
 
 type state struct {
 	Resets               map[string]resetState        `json:"resets"`
+	PublicBaselineReady  bool                         `json:"public_baseline_ready,omitempty"`
 	AccountUsage         *accountUsageState           `json:"account_usage,omitempty"`
+	AccountUsageHistory  []accountUsageObservation    `json:"account_usage_history,omitempty"`
 	PendingAccountReset  *accountResetCandidate       `json:"pending_account_reset,omitempty"`
 	AccountResets        map[string]accountResetState `json:"account_resets,omitempty"`
 	LastResetWatermarkAt string                       `json:"last_reset_watermark_at"`
@@ -217,20 +219,13 @@ func checkOnce(ctx context.Context, client *http.Client, cfg config) error {
 }
 
 func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, usageReader accountUsageReader) error {
-	data, err := fetchStatus(ctx, client)
-	if err != nil {
-		return err
-	}
-	resets, err := fetchResets(ctx, client)
-	if err != nil {
-		return err
-	}
-
 	current, exists, err := loadState(cfg.statePath)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
+	data, statusErr := fetchStatus(ctx, client)
+	resets, resetsErr := fetchResets(ctx, client)
 	var usage *accountUsageSnapshot
 	if usageReader != nil {
 		value, readErr := usageReader.Read(ctx)
@@ -241,19 +236,36 @@ func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, us
 		}
 	}
 	if !exists {
-		current = baselineState(data, resets, now)
+		current = state{Resets: make(map[string]resetState), AccountResets: make(map[string]accountResetState)}
+		if statusErr == nil && resetsErr == nil {
+			current = baselineState(data, resets, now)
+		}
 		if usage != nil {
 			setAccountUsageBaseline(&current, *usage)
+			recordAccountObservation(&current, *usage, now, "baseline")
 		}
 		if err := saveState(cfg.statePath, current); err != nil {
 			return err
 		}
 		log.Print("첫 실행 기준 상태를 저장했습니다")
-		return nil
+		return errors.Join(statusErr, resetsErr)
 	}
 	migrateLegacyState(&current, resets, now)
+	if !current.PublicBaselineReady && statusErr == nil && resetsErr == nil {
+		baseline := baselineState(data, resets, now)
+		baseline.AccountUsage = current.AccountUsage
+		baseline.AccountUsageHistory = current.AccountUsageHistory
+		baseline.PendingAccountReset = current.PendingAccountReset
+		baseline.AccountResets = current.AccountResets
+		current = baseline
+	}
+
+	resetsForMatching := resets
+	if resetsErr != nil {
+		resetsForMatching = resetsFromCurrentState(current)
+	}
 	if usage != nil {
-		pendingCreated, processErr := processAccountUsage(ctx, client, cfg, &current, *usage, resets, now)
+		pendingCreated, processErr := processAccountUsage(ctx, client, cfg, &current, *usage, resetsForMatching, now)
 		if processErr != nil {
 			return processErr
 		}
@@ -271,7 +283,7 @@ func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, us
 			confirmed, readErr := usageReader.Read(ctx)
 			if readErr != nil {
 				log.Printf("Codex 계정 리셋 재확인 실패, 다음 조회에서 재시도합니다: %v", readErr)
-			} else if _, processErr := processAccountUsage(ctx, client, cfg, &current, confirmed, resets, time.Now().UTC()); processErr != nil {
+			} else if _, processErr := processAccountUsage(ctx, client, cfg, &current, confirmed, resetsForMatching, time.Now().UTC()); processErr != nil {
 				return processErr
 			} else if err := saveState(cfg.statePath, current); err != nil {
 				return err
@@ -279,18 +291,22 @@ func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, us
 		}
 	}
 
-	if err := processResets(ctx, client, cfg, &current, resets, now); err != nil {
-		return err
+	if current.PublicBaselineReady && resetsErr == nil {
+		if err := processResets(ctx, client, cfg, &current, resets, now); err != nil {
+			return err
+		}
 	}
-	if err := processWatch(ctx, client, cfg, &current, data); err != nil {
-		return err
+	if current.PublicBaselineReady && statusErr == nil {
+		if err := processWatch(ctx, client, cfg, &current, data); err != nil {
+			return err
+		}
 	}
 	pruneResetStates(&current, resetStateLimit)
 	pruneAccountResetStates(&current, resetStateLimit)
 	if err := saveState(cfg.statePath, current); err != nil {
 		return err
 	}
-	return nil
+	return errors.Join(statusErr, resetsErr)
 }
 
 func fetchStatus(ctx context.Context, client *http.Client) (statusData, error) {
@@ -344,7 +360,7 @@ func fetchResets(ctx context.Context, client *http.Client) ([]reset, error) {
 }
 
 func baselineState(data statusData, resets []reset, now time.Time) state {
-	result := state{Resets: make(map[string]resetState)}
+	result := state{Resets: make(map[string]resetState), PublicBaselineReady: true}
 	for _, value := range resets {
 		item := resetStateFrom(value, now)
 		item.Notified = true
@@ -388,6 +404,17 @@ func migrateLegacyState(value *state, resets []reset, now time.Time) {
 	value.LegacyResetSource = ""
 	value.LegacyLastResetURL = ""
 	initializeResetWatermark(value)
+	if !value.PublicBaselineReady && (len(value.Resets) > 0 || value.LastResetWatermarkAt != "") {
+		value.PublicBaselineReady = true
+	}
+}
+
+func resetsFromCurrentState(current state) []reset {
+	values := make([]reset, 0, len(current.Resets))
+	for id, saved := range current.Resets {
+		values = append(values, resetFromState(id, saved))
+	}
+	return values
 }
 
 func resetStateFrom(value reset, firstSeenAt time.Time) resetState {

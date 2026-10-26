@@ -128,7 +128,7 @@ func TestAccountResetRequiresTwoObservationsAndDoesNotRepeat(t *testing.T) {
 	}
 }
 
-func TestNaturalResetAndSmallDropDoNotCreateCandidate(t *testing.T) {
+func TestScheduledResetAndUsageDropAreDetected(t *testing.T) {
 	requests, client := newTelegramTestClient(t)
 	cfg := testConfig(t.TempDir() + "/state.json")
 	now := time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC)
@@ -137,13 +137,21 @@ func TestNaturalResetAndSmallDropDoNotCreateCandidate(t *testing.T) {
 
 	natural := usageSnapshot("account", 5, now.Add(7*24*time.Hour), 1)
 	created, err := processAccountUsage(context.Background(), client, cfg, &current, natural, nil, now)
-	if err != nil || created || current.PendingAccountReset != nil {
-		t.Fatalf("자연 갱신이 후보로 생성됐습니다: created=%v err=%v state=%#v", created, err, current)
+	if err != nil || !created || current.PendingAccountReset == nil {
+		t.Fatalf("예정 시각의 실제 초기화가 후보로 생성되지 않았습니다: created=%v err=%v state=%#v", created, err, current)
 	}
+	if _, err := processAccountUsage(context.Background(), client, cfg, &current, natural, nil, now.Add(20*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 {
+		t.Fatalf("예정 시각의 계정 초기화 알림이 전송되지 않았습니다: %#v", *requests)
+	}
+
+	current.PendingAccountReset = nil
 	setAccountUsageBaseline(&current, usageSnapshot("account", 50, now.Add(5*24*time.Hour), 1))
 	small := usageSnapshot("account", 36, now.Add(5*24*time.Hour), 1)
 	created, err = processAccountUsage(context.Background(), client, cfg, &current, small, nil, now)
-	if err != nil || created || current.PendingAccountReset != nil || len(*requests) != 0 {
+	if err != nil || created || current.PendingAccountReset != nil || len(*requests) != 1 {
 		t.Fatalf("15%%p 미만 감소가 후보로 생성됐습니다: created=%v err=%v state=%#v", created, err, current)
 	}
 	withoutResetTime := usageSnapshot("account", 80, time.Unix(0, 0), 1)
@@ -152,8 +160,8 @@ func TestNaturalResetAndSmallDropDoNotCreateCandidate(t *testing.T) {
 	unknownSchedule := withoutResetTime
 	unknownSchedule.UsedPercent = 5
 	created, err = processAccountUsage(context.Background(), client, cfg, &current, unknownSchedule, nil, now)
-	if err != nil || created || current.PendingAccountReset != nil {
-		t.Fatalf("갱신 시각을 모르는 감소가 후보로 생성됐습니다: created=%v err=%v state=%#v", created, err, current)
+	if err != nil || !created || current.PendingAccountReset == nil || !current.PendingAccountReset.UsageDropSignal {
+		t.Fatalf("갱신 시각을 몰라도 명확한 사용률 급감이 후보가 되지 않았습니다: created=%v err=%v state=%#v", created, err, current)
 	}
 }
 
@@ -174,6 +182,109 @@ func TestAccountResetCandidateMustRemainOnSecondObservation(t *testing.T) {
 	}
 	if current.PendingAccountReset != nil || len(*requests) != 0 {
 		t.Fatalf("불일치 후보가 제거되지 않았습니다: state=%#v requests=%#v", current, *requests)
+	}
+}
+
+func TestAccountResetConfirmationAllowsResetTimeAdjustment(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(t.TempDir() + "/state.json")
+	now := time.Date(2026, 10, 26, 6, 2, 25, 0, time.UTC)
+	current := state{}
+	setAccountUsageBaseline(&current, usageSnapshot("account", 55, now.Add(4*24*time.Hour), 2))
+	after := usageSnapshot("account", 0, now.Add(7*24*time.Hour), 2)
+	if created, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now); err != nil || !created {
+		t.Fatalf("10월 26일 형태의 첫 후보 생성 실패: created=%v err=%v", created, err)
+	}
+	after.ResetsAt += 45
+	if created, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now.Add(20*time.Second)); err != nil || created {
+		t.Fatalf("재확인 처리 실패: created=%v err=%v", created, err)
+	}
+	if len(*requests) != 1 || !strings.Contains((*requests)[0].Text, "55% → 0%") || !strings.Contains((*requests)[0].Text, "사용률 급감") {
+		t.Fatalf("resets_at 미세 조정으로 실제 리셋이 누락됐습니다: %#v", *requests)
+	}
+}
+
+func TestLegacyPendingCandidateStillConfirms(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(t.TempDir() + "/state.json")
+	now := time.Date(2026, 10, 26, 6, 2, 25, 0, time.UTC)
+	after := usageSnapshot("account", 11, now.Add(7*24*time.Hour), 2)
+	current := state{PendingAccountReset: &accountResetCandidate{
+		AccountFingerprint:  "account",
+		LimitID:             "codex",
+		PlanType:            "plus",
+		PreviousUsedPercent: 55,
+		CurrentUsedPercent:  0,
+		PreviousResetsAt:    now.Add(4 * 24 * time.Hour).Unix(),
+		CurrentResetsAt:     after.ResetsAt,
+		FirstObservedAt:     now.Add(-20 * time.Second),
+	}}
+	setAccountUsageBaseline(&current, usageSnapshot("account", 0, now.Add(7*24*time.Hour), 2))
+	if _, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 || current.PendingAccountReset != nil {
+		t.Fatalf("기존 형식 후보가 확정되지 않았습니다: requests=%#v state=%#v", *requests, current)
+	}
+}
+
+func TestNewUsageWindowDetectsResetWithoutUsageDrop(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(t.TempDir() + "/state.json")
+	now := time.Date(2026, 10, 26, 6, 2, 25, 0, time.UTC)
+	current := state{}
+	setAccountUsageBaseline(&current, usageSnapshot("account", 0, now.Add(3*24*time.Hour), 2))
+	after := usageSnapshot("account", 0, now.Add(7*24*time.Hour), 2)
+	created, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now)
+	if err != nil || !created || current.PendingAccountReset == nil || !current.PendingAccountReset.NewWindowSignal {
+		t.Fatalf("0%% → 0%%인 새 사용량 창이 후보가 되지 않았습니다: created=%v err=%v state=%#v", created, err, current)
+	}
+	after.ResetsAt += 30
+	if _, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now.Add(20*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 || !strings.Contains((*requests)[0].Text, "새 사용량 창") {
+		t.Fatalf("새 사용량 창 알림이 전송되지 않았습니다: %#v", *requests)
+	}
+}
+
+func TestResetTimeCorrectionAloneDoesNotCreateCandidate(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(t.TempDir() + "/state.json")
+	now := time.Date(2026, 10, 26, 6, 2, 25, 0, time.UTC)
+	tests := []struct {
+		name     string
+		previous accountUsageSnapshot
+		current  accountUsageSnapshot
+	}{
+		{
+			name:     "사용량이 높은 시각 이동",
+			previous: usageSnapshot("account", 40, now.Add(4*24*time.Hour), 2),
+			current:  usageSnapshot("account", 40, now.Add(7*24*time.Hour), 2),
+		},
+		{
+			name:     "현재와 무관한 새 창 시작 시각",
+			previous: usageSnapshot("account", 0, now.Add(3*24*time.Hour), 2),
+			current:  usageSnapshot("account", 0, now.Add(8*24*time.Hour), 2),
+		},
+		{
+			name:     "30분 미만 미세 조정",
+			previous: usageSnapshot("account", 0, now.Add(7*24*time.Hour), 2),
+			current:  usageSnapshot("account", 0, now.Add(7*24*time.Hour+10*time.Minute), 2),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			current := state{}
+			setAccountUsageBaseline(&current, test.previous)
+			created, err := processAccountUsage(context.Background(), client, cfg, &current, test.current, nil, now)
+			if err != nil || created || current.PendingAccountReset != nil {
+				t.Fatalf("단순 시각 조정이 후보로 생성됐습니다: created=%v err=%v state=%#v", created, err, current)
+			}
+		})
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("단순 시각 조정으로 알림이 전송됐습니다: %#v", *requests)
 	}
 }
 
@@ -214,6 +325,25 @@ func TestDelayedUsageDropAfterBankedCreditUseIsSuppressed(t *testing.T) {
 	}
 }
 
+func TestBankedGrantAndRegularResetAreBothPreserved(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(t.TempDir() + "/state.json")
+	now := time.Date(2026, 10, 26, 6, 2, 25, 0, time.UTC)
+	current := state{}
+	setAccountUsageBaseline(&current, usageSnapshot("account", 60, now.Add(4*24*time.Hour), 1))
+	after := usageSnapshot("account", 0, now.Add(7*24*time.Hour), 2)
+	created, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now)
+	if err != nil || !created || len(*requests) != 1 || !strings.Contains((*requests)[0].Text, "banked reset 지급") {
+		t.Fatalf("동시 발생한 banked 지급 또는 regular 후보가 유실됐습니다: created=%v err=%v requests=%#v", created, err, *requests)
+	}
+	if _, err := processAccountUsage(context.Background(), client, cfg, &current, after, nil, now.Add(20*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 2 || !strings.Contains((*requests)[1].Text, "내 Codex 계정 리셋 감지") {
+		t.Fatalf("banked 지급과 regular 초기화가 모두 알려지지 않았습니다: %#v", *requests)
+	}
+}
+
 func TestAccountFirstThenOfficialAnnouncementReplies(t *testing.T) {
 	requests, client := newTelegramTestClient(t)
 	cfg := testConfig(t.TempDir() + "/state.json")
@@ -246,6 +376,26 @@ func TestOfficialFirstThenAccountDetectionReplies(t *testing.T) {
 	}
 	if len(*requests) != 2 || (*requests)[1].ReplyParameters == nil || (*requests)[1].ReplyParameters.MessageID != 1 || !strings.Contains((*requests)[1].Text, "내 Codex 계정에 리셋 반영") {
 		t.Fatalf("계정 반영이 공식 발표 메시지에 답장되지 않았습니다: %#v", *requests)
+	}
+}
+
+func TestOfficialAnnouncementOneDayBeforeAccountDetectionReplies(t *testing.T) {
+	requests, client := newTelegramTestClient(t)
+	cfg := testConfig(t.TempDir() + "/state.json")
+	now := time.Date(2026, 10, 26, 6, 2, 25, 0, time.UTC)
+	current := state{Resets: make(map[string]resetState), AccountResets: make(map[string]accountResetState)}
+	official := officialReset("official-day-before", now.Add(-24*time.Hour))
+	item := resetStateFrom(official, now.Add(-24*time.Hour))
+	item.Notified = true
+	item.TelegramMessageID = 73
+	current.Resets[official.ID] = item
+	event := regularAccountEvent(now)
+	event.DetectionReason = "usage_drop_and_new_window"
+	if err := notifyAccountReset(context.Background(), client, cfg, &current, event, []reset{official}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 || (*requests)[0].ReplyParameters == nil || (*requests)[0].ReplyParameters.MessageID != 73 {
+		t.Fatalf("하루 전 공식 발표에 계정 반영 답장이 연결되지 않았습니다: %#v", *requests)
 	}
 }
 
@@ -324,6 +474,21 @@ func TestPruneAccountResetStatesKeepsLatestFifty(t *testing.T) {
 	}
 }
 
+func TestAccountUsageHistoryKeepsLatestTwenty(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	current := state{}
+	for index := 0; index < 25; index++ {
+		snapshot := usageSnapshot("account", index, now.Add(7*24*time.Hour), 2)
+		recordAccountObservation(&current, snapshot, now.Add(time.Duration(index)*time.Minute), "normal")
+	}
+	if len(current.AccountUsageHistory) != 20 {
+		t.Fatalf("관측 이력 개수 = %d, 기대값 = 20", len(current.AccountUsageHistory))
+	}
+	if current.AccountUsageHistory[0].UsedPercent != 5 || current.AccountUsageHistory[19].UsedPercent != 24 {
+		t.Fatalf("최신 20건이 유지되지 않았습니다: %#v", current.AccountUsageHistory)
+	}
+}
+
 func TestAccountStateRoundTripDoesNotContainRawAccountID(t *testing.T) {
 	path := t.TempDir() + "/state.json"
 	current := state{Resets: make(map[string]resetState), AccountResets: make(map[string]accountResetState)}
@@ -335,6 +500,7 @@ func TestAccountStateRoundTripDoesNotContainRawAccountID(t *testing.T) {
 		t.Fatal(err)
 	}
 	setAccountUsageBaseline(&current, snapshot)
+	recordAccountObservation(&current, snapshot, time.Now().UTC(), "baseline")
 	if err := saveState(path, current); err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +512,7 @@ func TestAccountStateRoundTripDoesNotContainRawAccountID(t *testing.T) {
 		t.Fatal("state.json에 원문 계정 ID가 저장됐습니다")
 	}
 	loaded, exists, err := loadState(path)
-	if err != nil || !exists || loaded.AccountUsage == nil || loaded.AccountUsage.AccountFingerprint == "" {
+	if err != nil || !exists || loaded.AccountUsage == nil || loaded.AccountUsage.AccountFingerprint == "" || len(loaded.AccountUsageHistory) != 1 {
 		t.Fatalf("계정 상태 왕복 저장에 실패했습니다: exists=%v err=%v state=%#v", exists, err, loaded)
 	}
 }
@@ -403,6 +569,64 @@ func TestAccountUsageFailureDoesNotStopPublicResetMonitoring(t *testing.T) {
 	}
 }
 
+func TestPublicAPIFailureDoesNotStopAccountResetMonitoring(t *testing.T) {
+	now := time.Date(2026, 10, 26, 6, 2, 45, 0, time.UTC)
+	path := t.TempDir() + "/state.json"
+	baselineSnapshot := usageSnapshot("account", 0, now.Add(7*24*time.Hour), 2)
+	current := state{
+		Resets:              make(map[string]resetState),
+		PublicBaselineReady: true,
+		AccountResets:       make(map[string]accountResetState),
+		PendingAccountReset: &accountResetCandidate{
+			AccountFingerprint:  "account",
+			LimitID:             "codex",
+			PlanType:            "plus",
+			PreviousUsedPercent: 55,
+			CurrentUsedPercent:  0,
+			PreviousResetsAt:    now.Add(-3 * 24 * time.Hour).Unix(),
+			CurrentResetsAt:     baselineSnapshot.ResetsAt,
+			FirstObservedAt:     now.Add(-20 * time.Second),
+			UsageDropSignal:     true,
+			NewWindowSignal:     true,
+			DetectionReason:     "usage_drop_and_new_window",
+		},
+	}
+	setAccountUsageBaseline(&current, baselineSnapshot)
+	if err := saveState(path, current); err != nil {
+		t.Fatal(err)
+	}
+
+	telegramRequests := make([]telegramRequest, 0, 1)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Status:     "503 Service Unavailable",
+				Body:       io.NopCloser(strings.NewReader(`{"detail":"temporary failure"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}
+		var telegramRequest telegramRequest
+		if err := json.NewDecoder(request.Body).Decode(&telegramRequest); err != nil {
+			return nil, err
+		}
+		telegramRequests = append(telegramRequests, telegramRequest)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":9}}`)), Header: make(http.Header)}, nil
+	})}
+	cfg := testConfig(path)
+	err := checkOnceWithUsage(context.Background(), client, cfg, staticUsageReader{snapshot: baselineSnapshot})
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("공개 API 오류가 반환되지 않았습니다: %v", err)
+	}
+	if len(telegramRequests) != 1 || !strings.Contains(telegramRequests[0].Text, "내 Codex 계정 리셋 감지") {
+		t.Fatalf("공개 API 장애 중 계정 리셋 알림이 전송되지 않았습니다: %#v", telegramRequests)
+	}
+	loaded, _, loadErr := loadState(path)
+	if loadErr != nil || len(loaded.AccountResets) != 1 || loaded.PendingAccountReset != nil {
+		t.Fatalf("공개 API 장애 중 계정 상태가 저장되지 않았습니다: err=%v state=%#v", loadErr, loaded)
+	}
+}
+
 func usageSnapshot(account string, used int, resetsAt time.Time, credits int64) accountUsageSnapshot {
 	return accountUsageSnapshot{
 		AccountFingerprint: account,
@@ -450,4 +674,12 @@ type failingUsageReader struct{}
 
 func (failingUsageReader) Read(context.Context) (accountUsageSnapshot, error) {
 	return accountUsageSnapshot{}, errors.New("의도한 계정 조회 실패")
+}
+
+type staticUsageReader struct {
+	snapshot accountUsageSnapshot
+}
+
+func (reader staticUsageReader) Read(context.Context) (accountUsageSnapshot, error) {
+	return reader.snapshot, nil
 }

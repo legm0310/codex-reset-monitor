@@ -127,3 +127,34 @@
 - `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
 - `CODEX_USAGE_INTEGRATION_TEST=1` 통합 테스트에서 실제 로컬 계정의 `codex` 10,080분 제한을 읽었고 Telegram 메시지는 전송하지 않았다.
 - 실행용 `codex-reset-monitor` 바이너리를 최종 소스로 다시 빌드했으며 `.gitignore` 정책에 따라 커밋 대상에서는 제외한다.
+
+## 2026-10-26 계정 리셋 누락 보완 결정
+
+- 10월 26일 계정의 10,080분 사용량 창이 새로 시작됐지만 `account_resets` 이벤트가 생성되지 않은 사실을 확인했다.
+- 당시 사용량이 50% 이상에서 초기화됐다는 사용자 확인이 있으므로 계정 알림이 발생했어야 하며 실제 누락으로 판단한다.
+- 최신값만 저장하는 기존 상태로는 첫 관측, 20초 재확인, 제외 분기 중 어디에서 누락됐는지 사후 확정할 수 없다.
+- 계정 사용량 조회를 codex-resets.com의 상태·목록 API 성공 여부와 분리한다.
+- 15%p 이상 사용률 감소와 새 사용량 창 시작을 독립 신호로 사용한다.
+- 새 사용량 창은 `resets_at - window_duration`이 현재 관측 시각 근처이고 사용률이 초기 상태에 가까우며 `resets_at`이 앞으로 이동한 경우로 판정한다.
+- 자연 갱신 여부와 무관하게 실제 계정 초기화 신호가 두 번 확인되면 알린다.
+- 20초 재확인에서는 `resets_at` 완전 일치를 요구하지 않고 동일한 새 사용량 창 범위인지 확인한다.
+- banked 크레딧 증가는 banked 이벤트로 처리하면서 regular 신호 판정도 계속해 동시 발생을 보존한다.
+- 최근 계정 관측값과 판정 결과는 민감정보 없이 최대 20건만 `state.json`에 저장한다.
+- 후보 생성·확정·취소와 제외 사유를 로그에 남겨 다음 누락을 재현 가능하게 한다.
+- 10월 25일 공식 발표와 10월 26일 계정 반영의 약 24시간 차이를 연결할 수 있도록 공식 발표 선행 매핑 범위를 12시간에서 36시간으로 늘린다. 같은 종류 후보가 둘 이상이면 기존처럼 자동 매핑하지 않는다.
+- `55% → 0%` 감소와 새 7일 창이 함께 시작되고 재확인 중 `resets_at`이 45초 조정되는 회귀 테스트가 통과했다.
+- 사용률 변화가 `0% → 0%`여도 현재 시각에 새 사용량 창이 시작되면 두 번 확인 후 알리는 테스트가 통과했다.
+- 사용량이 높은 상태의 시각 이동, 현재와 무관한 창 시작 시각, 30분 미만 조정은 후보가 되지 않는 테스트가 통과했다.
+- 하루 전 공식 발표의 Telegram 메시지에 계정 반영 확인을 답장하는 테스트가 통과했다.
+- codex-resets.com의 상태와 목록 API가 모두 503이어도 계정 후보 확정, Telegram 전송, 상태 저장이 수행되는 테스트가 통과했다.
+- 기존 형식의 pending 후보도 사용률 감소 신호로 마이그레이션해 확정할 수 있게 했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go test -race ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go vet ./...`가 통과했다.
+- `env GOCACHE=/tmp/codex-reset-monitor-go-cache go build -o /tmp/codex-reset-monitor .`가 통과했다.
+- 실제 로컬 app-server 읽기 전용 통합 테스트에서 `codex`, `prolite`, 10,080분 주간 창 응답을 정상 처리했다.
+- 실행용 바이너리를 갱신하고 기존 프로세스를 종료한 뒤 launchctl 제출 작업 `com.legm0310.codex-reset-monitor`로 다시 실행했다.
+- launchctl의 기본 `PATH`에는 nvm의 `codex`가 없어 첫 시도가 실패했으며 실제 오류 `exec: "codex": executable file not found in $PATH`를 확인했다.
+- 실행 작업에 `CODEX_BINARY=/Users/dev4/.nvm/versions/node/v22.22.0/bin/codex`를 명시해 보완했다.
+- 새 프로세스 PID 50847이 실행 중이며, 재시작 후 계정 관측 이력이 2건으로 증가하고 최신 결과가 `normal`로 저장됐다.
+- 재시작 전후 `account_resets`는 1건, pending 후보는 없어서 과거 이벤트 재전송이나 거짓 후보가 생성되지 않았다.

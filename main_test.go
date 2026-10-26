@@ -306,6 +306,9 @@ func TestMigrateLegacyState(t *testing.T) {
 	if got.LastResetWatermarkAt != "2026-08-26T00:00:00Z" {
 		t.Fatalf("watermark 자동 마이그레이션 실패: %q", got.LastResetWatermarkAt)
 	}
+	if !got.PublicBaselineReady {
+		t.Fatal("기존 공개 API 상태가 기준선 완료 상태로 마이그레이션되지 않았습니다")
+	}
 }
 
 func TestSaveAndLoadState(t *testing.T) {
