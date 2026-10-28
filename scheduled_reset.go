@@ -267,7 +267,7 @@ func combinedScheduledAccountNotification(event accountResetState, scheduled sch
 }
 
 func actualResetMatchedNotification(value reset) string {
-	message := fmt.Sprintf("🔗 예정된 Codex 리셋의 실제 발생이 확인되었습니다\n확인 시각 (KST). %s", formatKST(value.AnnouncedAt))
+	message := fmt.Sprintf("📣 예정된 Codex 리셋 완료 발표가 확인되었습니다\n상태. 내 계정 반영 확인 대기 중\n발표 시각 (KST). %s", formatKST(value.AnnouncedAt))
 	if value.Source.URL != "" {
 		message += "\n" + value.Source.URL
 	}

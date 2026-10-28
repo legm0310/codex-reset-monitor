@@ -209,6 +209,9 @@ func TestActualResetJoinsScheduledGroupAndDoesNotRepeat(t *testing.T) {
 	if len(*requests) != 2 || (*requests)[1].ReplyParameters == nil || (*requests)[1].ReplyParameters.MessageID != 1 {
 		t.Fatalf("실제 리셋이 예정 발표 그룹에 답장되지 않았습니다: %#v", *requests)
 	}
+	if !strings.Contains((*requests)[1].Text, "리셋 완료 발표가 확인되었습니다") || !strings.Contains((*requests)[1].Text, "내 계정 반영 확인 대기 중") || strings.Contains((*requests)[1].Text, "실제 발생이 확인되었습니다") {
+		t.Fatalf("완료 발표와 계정 반영 상태가 명확히 구분되지 않았습니다: %q", (*requests)[1].Text)
+	}
 	if current.ScheduledResets[scheduled.ID].ActualResetID != actual.ID || current.Resets[actual.ID].ScheduledResetID != scheduled.ID {
 		t.Fatalf("실제 리셋과 예정 발표의 상호 참조가 저장되지 않았습니다: scheduled=%#v reset=%#v", current.ScheduledResets[scheduled.ID], current.Resets[actual.ID])
 	}
