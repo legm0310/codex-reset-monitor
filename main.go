@@ -50,8 +50,9 @@ type resetListResponse struct {
 }
 
 type statusData struct {
-	LatestReset *reset `json:"latest_reset"`
-	ActiveWatch *watch `json:"active_watch"`
+	LatestReset    *reset          `json:"latest_reset"`
+	ScheduledReset *scheduledReset `json:"scheduled_reset"`
+	ActiveWatch    *watch          `json:"active_watch"`
 }
 
 type reset struct {
@@ -76,21 +77,22 @@ type source struct {
 }
 
 type state struct {
-	Resets               map[string]resetState        `json:"resets"`
-	PublicBaselineReady  bool                         `json:"public_baseline_ready,omitempty"`
-	AccountUsage         *accountUsageState           `json:"account_usage,omitempty"`
-	AccountUsageHistory  []accountUsageObservation    `json:"account_usage_history,omitempty"`
-	PendingAccountReset  *accountResetCandidate       `json:"pending_account_reset,omitempty"`
-	AccountResets        map[string]accountResetState `json:"account_resets,omitempty"`
-	LastResetWatermarkAt string                       `json:"last_reset_watermark_at"`
-	LastWatchObservedAt  string                       `json:"last_watch_observed_at"`
-	LastWatchLevel       string                       `json:"last_watch_level"`
-	LastWatchPercent     *int                         `json:"last_watch_percent"`
-	LegacyLastResetID    string                       `json:"last_reset_id,omitempty"`
-	LegacyLastResetType  string                       `json:"last_reset_type,omitempty"`
-	LegacyAnnouncedAt    string                       `json:"last_reset_announced_at,omitempty"`
-	LegacyResetSource    string                       `json:"last_reset_source_type,omitempty"`
-	LegacyLastResetURL   string                       `json:"last_reset_url,omitempty"`
+	Resets               map[string]resetState          `json:"resets"`
+	ScheduledResets      map[string]scheduledResetState `json:"scheduled_resets,omitempty"`
+	PublicBaselineReady  bool                           `json:"public_baseline_ready,omitempty"`
+	AccountUsage         *accountUsageState             `json:"account_usage,omitempty"`
+	AccountUsageHistory  []accountUsageObservation      `json:"account_usage_history,omitempty"`
+	PendingAccountReset  *accountResetCandidate         `json:"pending_account_reset,omitempty"`
+	AccountResets        map[string]accountResetState   `json:"account_resets,omitempty"`
+	LastResetWatermarkAt string                         `json:"last_reset_watermark_at"`
+	LastWatchObservedAt  string                         `json:"last_watch_observed_at"`
+	LastWatchLevel       string                         `json:"last_watch_level"`
+	LastWatchPercent     *int                           `json:"last_watch_percent"`
+	LegacyLastResetID    string                         `json:"last_reset_id,omitempty"`
+	LegacyLastResetType  string                         `json:"last_reset_type,omitempty"`
+	LegacyAnnouncedAt    string                         `json:"last_reset_announced_at,omitempty"`
+	LegacyResetSource    string                         `json:"last_reset_source_type,omitempty"`
+	LegacyLastResetURL   string                         `json:"last_reset_url,omitempty"`
 }
 
 type resetState struct {
@@ -102,6 +104,7 @@ type resetState struct {
 	Notified          bool      `json:"notified"`
 	TelegramMessageID int       `json:"telegram_message_id"`
 	AccountResetID    string    `json:"account_reset_id,omitempty"`
+	ScheduledResetID  string    `json:"scheduled_reset_id,omitempty"`
 }
 
 func main() {
@@ -236,7 +239,7 @@ func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, us
 		}
 	}
 	if !exists {
-		current = state{Resets: make(map[string]resetState), AccountResets: make(map[string]accountResetState)}
+		current = state{Resets: make(map[string]resetState), ScheduledResets: make(map[string]scheduledResetState), AccountResets: make(map[string]accountResetState)}
 		if statusErr == nil && resetsErr == nil {
 			current = baselineState(data, resets, now)
 		}
@@ -258,6 +261,16 @@ func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, us
 		baseline.PendingAccountReset = current.PendingAccountReset
 		baseline.AccountResets = current.AccountResets
 		current = baseline
+	}
+	if current.PublicBaselineReady && statusErr == nil {
+		if err := processScheduledReset(ctx, client, cfg, &current, data.ScheduledReset, now); err != nil {
+			return err
+		}
+		if err := saveState(cfg.statePath, current); err != nil {
+			return err
+		}
+	} else {
+		expireScheduledResets(&current, now)
 	}
 
 	resetsForMatching := resets
@@ -302,6 +315,7 @@ func checkOnceWithUsage(ctx context.Context, client *http.Client, cfg config, us
 		}
 	}
 	pruneResetStates(&current, resetStateLimit)
+	pruneScheduledResetStates(&current, resetStateLimit)
 	pruneAccountResetStates(&current, resetStateLimit)
 	if err := saveState(cfg.statePath, current); err != nil {
 		return err
@@ -360,7 +374,7 @@ func fetchResets(ctx context.Context, client *http.Client) ([]reset, error) {
 }
 
 func baselineState(data statusData, resets []reset, now time.Time) state {
-	result := state{Resets: make(map[string]resetState), PublicBaselineReady: true}
+	result := state{Resets: make(map[string]resetState), ScheduledResets: make(map[string]scheduledResetState), PublicBaselineReady: true}
 	for _, value := range resets {
 		item := resetStateFrom(value, now)
 		item.Notified = true
@@ -372,12 +386,20 @@ func baselineState(data statusData, resets []reset, now time.Time) state {
 		result.LastWatchLevel = data.ActiveWatch.Level
 		result.LastWatchPercent = data.ActiveWatch.ResetChancePercent
 	}
+	if data.ScheduledReset != nil {
+		item := scheduledResetStateFrom(*data.ScheduledReset, now)
+		item.Notified = true
+		result.ScheduledResets[data.ScheduledReset.ID] = item
+	}
 	return result
 }
 
 func migrateLegacyState(value *state, resets []reset, now time.Time) {
 	if value.Resets == nil {
 		value.Resets = make(map[string]resetState)
+	}
+	if value.ScheduledResets == nil {
+		value.ScheduledResets = make(map[string]scheduledResetState)
 	}
 	if value.LegacyLastResetID != "" {
 		legacyID := value.LegacyLastResetID
@@ -467,14 +489,50 @@ func processResets(ctx context.Context, client *http.Client, cfg config, current
 				accountEvent.OfficialResetID = value.ID
 				current.AccountResets[accountResetID] = accountEvent
 				saved.AccountResetID = accountResetID
+				saved.ScheduledResetID = accountEvent.ScheduledResetID
 				saved.Notified = true
 				saved.TelegramMessageID = accountEvent.TelegramMessageID
-				if value.Source.URL != "" {
+				shouldReply := value.Source.URL != ""
+				if accountEvent.ScheduledResetID != "" {
+					scheduled := current.ScheduledResets[accountEvent.ScheduledResetID]
+					scheduled.ActualResetID = value.ID
+					current.ScheduledResets[accountEvent.ScheduledResetID] = scheduled
+					shouldReply = shouldReply && scheduled.URL != value.Source.URL
+				}
+				if shouldReply {
 					if _, err := sendTelegram(ctx, client, cfg, officialMatchedNotification(value), accountEvent.TelegramMessageID); err != nil {
 						return fmt.Errorf("공식 발표 매핑 답장 전송: %w", err)
 					}
 					notificationSent = true
 				}
+			}
+		}
+
+		if !saved.Notified {
+			scheduledID, scheduled, matchCount := findScheduledMatchForReset(*current, value)
+			if matchCount == 1 {
+				saved.ScheduledResetID = scheduledID
+				saved.Notified = true
+				saved.TelegramMessageID = scheduled.TelegramMessageID
+				scheduled.ActualResetID = value.ID
+				if scheduled.TelegramMessageID != 0 {
+					if value.Source.URL != "" && value.Source.URL != scheduled.URL {
+						if _, err := sendTelegram(ctx, client, cfg, actualResetMatchedNotification(value), scheduled.TelegramMessageID); err != nil {
+							return fmt.Errorf("예정 리셋 실제 발생 답장 전송: %w", err)
+						}
+						notificationSent = true
+					}
+				} else {
+					messageID, err := sendTelegram(ctx, client, cfg, resetNotification(value), 0)
+					if err != nil {
+						return fmt.Errorf("예정 리셋 실제 발생 알림 전송: %w", err)
+					}
+					saved.TelegramMessageID = messageID
+					scheduled.TelegramMessageID = messageID
+					scheduled.Notified = true
+					notificationSent = true
+				}
+				current.ScheduledResets[scheduledID] = scheduled
 			}
 		}
 

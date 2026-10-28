@@ -79,22 +79,25 @@ type accountResetCandidate struct {
 }
 
 type accountResetState struct {
-	ResetType           string    `json:"reset_type"`
-	DetectedAt          time.Time `json:"detected_at"`
-	AccountFingerprint  string    `json:"account_fingerprint"`
-	LimitID             string    `json:"limit_id"`
-	PlanType            string    `json:"plan_type"`
-	PreviousUsedPercent int       `json:"previous_used_percent"`
-	CurrentUsedPercent  int       `json:"current_used_percent"`
-	PreviousResetsAt    int64     `json:"previous_resets_at"`
-	CurrentResetsAt     int64     `json:"current_resets_at"`
-	PreviousCredits     *int64    `json:"previous_reset_credits,omitempty"`
-	CurrentCredits      *int64    `json:"current_reset_credits,omitempty"`
-	OfficialResetID     string    `json:"official_reset_id,omitempty"`
-	MappingAmbiguous    bool      `json:"mapping_ambiguous,omitempty"`
-	Notified            bool      `json:"notified"`
-	TelegramMessageID   int       `json:"telegram_message_id"`
-	DetectionReason     string    `json:"detection_reason,omitempty"`
+	ResetType                 string    `json:"reset_type"`
+	DetectedAt                time.Time `json:"detected_at"`
+	AccountFingerprint        string    `json:"account_fingerprint"`
+	LimitID                   string    `json:"limit_id"`
+	PlanType                  string    `json:"plan_type"`
+	PreviousUsedPercent       int       `json:"previous_used_percent"`
+	CurrentUsedPercent        int       `json:"current_used_percent"`
+	PreviousResetsAt          int64     `json:"previous_resets_at"`
+	CurrentResetsAt           int64     `json:"current_resets_at"`
+	WindowDurationMins        int64     `json:"window_duration_mins,omitempty"`
+	PreviousCredits           *int64    `json:"previous_reset_credits,omitempty"`
+	CurrentCredits            *int64    `json:"current_reset_credits,omitempty"`
+	OfficialResetID           string    `json:"official_reset_id,omitempty"`
+	ScheduledResetID          string    `json:"scheduled_reset_id,omitempty"`
+	MappingAmbiguous          bool      `json:"mapping_ambiguous,omitempty"`
+	ScheduledMappingAmbiguous bool      `json:"scheduled_mapping_ambiguous,omitempty"`
+	Notified                  bool      `json:"notified"`
+	TelegramMessageID         int       `json:"telegram_message_id"`
+	DetectionReason           string    `json:"detection_reason,omitempty"`
 }
 
 type accountUsageObservation struct {
@@ -390,6 +393,7 @@ func processAccountUsage(ctx context.Context, client *http.Client, cfg config, c
 				CurrentUsedPercent:  snapshot.UsedPercent,
 				PreviousResetsAt:    candidate.PreviousResetsAt,
 				CurrentResetsAt:     snapshot.ResetsAt,
+				WindowDurationMins:  snapshot.WindowDurationMins,
 				PreviousCredits:     cloneInt64(previous.ResetCredits),
 				CurrentCredits:      cloneInt64(snapshot.ResetCredits),
 				DetectionReason:     resetDetectionReason(usageDropConfirmed, newWindowConfirmed),
@@ -468,6 +472,43 @@ func notifyAccountReset(ctx context.Context, client *http.Client, cfg config, cu
 	eventID := accountResetID(event)
 	if _, exists := current.AccountResets[eventID]; exists {
 		return nil
+	}
+	scheduledID, scheduled, scheduledMatchCount := findScheduledMatch(*current, event)
+	if scheduledMatchCount == 1 {
+		event.ScheduledResetID = scheduledID
+		scheduled.AccountResetID = eventID
+		scheduled.Status = scheduledStatusApplied
+		if scheduled.ActualResetID != "" {
+			event.OfficialResetID = scheduled.ActualResetID
+			if actual, exists := current.Resets[scheduled.ActualResetID]; exists {
+				actual.AccountResetID = eventID
+				actual.ScheduledResetID = scheduledID
+				current.Resets[scheduled.ActualResetID] = actual
+			}
+		}
+		if scheduled.Notified && scheduled.TelegramMessageID != 0 {
+			messageID, err := sendTelegram(ctx, client, cfg, accountAppliedNotification(event), scheduled.TelegramMessageID)
+			if err != nil {
+				return fmt.Errorf("예정 발표 계정 반영 답장 전송: %w", err)
+			}
+			event.TelegramMessageID = messageID
+			event.Notified = true
+		} else {
+			messageID, err := sendTelegram(ctx, client, cfg, combinedScheduledAccountNotification(event, scheduledResetFromState(scheduledID, scheduled)), 0)
+			if err != nil {
+				return fmt.Errorf("계정·예정 발표 결합 알림 전송: %w", err)
+			}
+			event.TelegramMessageID = messageID
+			event.Notified = true
+			scheduled.Notified = true
+			scheduled.TelegramMessageID = messageID
+		}
+		current.ScheduledResets[scheduledID] = scheduled
+		current.AccountResets[eventID] = event
+		return nil
+	}
+	if scheduledMatchCount > 1 {
+		event.ScheduledMappingAmbiguous = true
 	}
 	matched, matchCount := findOfficialMatch(*current, event, resets)
 	if matchCount == 1 {
@@ -601,6 +642,7 @@ func newAccountResetState(resetType string, previous accountUsageState, current 
 		CurrentUsedPercent:  current.UsedPercent,
 		PreviousResetsAt:    previous.ResetsAt,
 		CurrentResetsAt:     current.ResetsAt,
+		WindowDurationMins:  current.WindowDurationMins,
 		PreviousCredits:     cloneInt64(previous.ResetCredits),
 		CurrentCredits:      cloneInt64(current.ResetCredits),
 	}
